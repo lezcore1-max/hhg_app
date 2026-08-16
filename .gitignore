@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+
+# Secrets — never commit real keys
+.env
+# .env.example is safe to commit (no real keys)
+
+# Large training data files (not needed for inference)
+asmtrain.parquet
+hintrain.parquet
+hinval.parquet
+qa_retriever_cache.pkl
+final_data.csv
+
+# Notebooks
+*.ipynb
+
+# Node
+node_modules/
+
+# Local IDE
+.vscode/
+.agents/
