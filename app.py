@@ -14,6 +14,33 @@ from rank_bm25 import BM25Okapi
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import faiss
 
+HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "lezcore1-max/tilt-rag-data")
+
+def _ensure_data_files():
+    """Download FAISS indexes and Parquet from HuggingFace Hub if not present locally."""
+    files_needed = ["index_q.faiss", "index_qa.faiss", "qa_pool.parquet"]
+    missing = [f for f in files_needed if not os.path.exists(f)]
+    if not missing:
+        return
+    print(f"⬇️  Data files missing: {missing}. Downloading from HuggingFace Hub ({HF_DATASET_REPO})...")
+    try:
+        from huggingface_hub import hf_hub_download
+        for fname in missing:
+            print(f"   Downloading {fname}...")
+            hf_hub_download(
+                repo_id=HF_DATASET_REPO,
+                filename=fname,
+                repo_type="dataset",
+                local_dir="."
+            )
+            print(f"   ✅ {fname} ready.")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to download data files from HuggingFace Hub '{HF_DATASET_REPO}': {e}\n"
+            "Place index_q.faiss, index_qa.faiss, qa_pool.parquet in the working directory "
+            "or set HF_DATASET_REPO env variable."
+        )
+
 # Load environment variables (.env file)
 load_dotenv()
 
@@ -62,16 +89,16 @@ def startup_event():
     print("🚀 INITIALIZING HINDI RAG ENGINE (NATIVE FAISS + PARQUET)...")
     print("=" * 60)
 
+    # 0. Auto-download data files from HuggingFace Hub if needed
+    _ensure_data_files()
+
     # 1. Load Parquet Data
-    if not os.path.exists(PARQUET_PATH):
-        raise FileNotFoundError(f"Missing '{PARQUET_PATH}' file in working directory.")
     print(f"📦 Loading dataset from {PARQUET_PATH}...")
     df = pd.read_parquet(PARQUET_PATH)
     print(f"   Loaded {len(df):,} QA records.")
 
     # 2. Load Native FAISS Indexes
-    if not os.path.exists(INDEX_Q_PATH) or not os.path.exists(INDEX_QA_PATH):
-        raise FileNotFoundError("Missing .faiss index files in working directory.")
+    print(f"⚡ Loading native FAISS indexes...")
     print(f"⚡ Loading native FAISS indexes ({INDEX_Q_PATH}, {INDEX_QA_PATH})...")
     index_q = faiss.read_index(INDEX_Q_PATH)
     index_qa = faiss.read_index(INDEX_QA_PATH)
