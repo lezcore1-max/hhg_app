@@ -137,9 +137,9 @@ def guardrail_check(query_text: str, top_results: list, score_threshold: float =
     if top["score"] < score_threshold:
         return {"should_answer": False, "reason": "low_confidence_off_topic", "top_score": top["score"]}
 
-    q_emb = embed_model.encode([f"query: {query_text}"], normalize_embeddings=True)
-    mq_emb = embed_model.encode([f"passage: {top['query']}"], normalize_embeddings=True)
-    semantic_sim = float(np.dot(q_emb[0], mq_emb[0]))
+    q_emb = get_query_embedding(query_text)
+    mq_emb = get_query_embedding(top['query'])
+    semantic_sim = float(np.dot(q_emb, mq_emb))
 
     if semantic_sim < semantic_sim_threshold:
         return {
@@ -165,8 +165,7 @@ def health_check():
         "engine": "Hindi RAG QA Engine v2.0",
         "records_indexed": len(df) if df is not None else 0,
         "models": {
-            "embedding": EMBED_MODEL_NAME,
-            "reranker": RERANKER_MODEL_NAME,
+            "embedding": f"HF Inference API ({EMBED_MODEL_NAME})",
             "llm": "gemini-3.1-flash-lite"
         }
     }
