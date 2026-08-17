@@ -79,7 +79,12 @@ HF_INFERENCE_URL = f"https://router.huggingface.co/hf-inference/models/{EMBED_MO
 def get_query_embedding(query_text: str) -> np.ndarray:
     """Get embedding from HuggingFace Inference API (same model as FAISS index was built with)."""
     hf_token = os.environ.get("HF_TOKEN", "")
-    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+    headers = {
+        "x-use-pipeline": "feature-extraction"
+    }
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+
     payload = {"inputs": f"query: {query_text}", "options": {"wait_for_model": True}}
     response = requests.post(HF_INFERENCE_URL, headers=headers, json=payload, timeout=30)
     if response.status_code != 200:
