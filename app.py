@@ -293,7 +293,18 @@ async def voice_ask_question(file: UploadFile = File(...)):
         url = "https://api.sarvam.ai/speech-to-text"
         headers = {"api-subscription-key": SARVAM_API_KEY}
         
-        content_type = file.content_type or "audio/webm"
+        raw_ct = (file.content_type or "audio/webm").lower()
+        if "webm" in raw_ct:
+            content_type = "audio/webm"
+        elif "wav" in raw_ct:
+            content_type = "audio/wav"
+        elif "mp4" in raw_ct or "m4a" in raw_ct:
+            content_type = "audio/mp4"
+        elif "ogg" in raw_ct:
+            content_type = "audio/ogg"
+        else:
+            content_type = raw_ct.split(";")[0].strip()
+
         with open(temp_path, "rb") as audio_file:
             files = {"file": (file.filename, audio_file, content_type)}
             data = {"model": "saaras:v3"}
