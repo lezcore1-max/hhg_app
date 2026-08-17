@@ -1,17 +1,14 @@
 import os
 import time
-import math
 import numpy as np
 import pandas as pd
-import torch
+import requests
 import google.generativeai as genai
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import faiss
 
 HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "lezcore1-max/tilt-rag-data")
@@ -72,19 +69,36 @@ df = None
 index_q = None
 index_qa = None
 bm25 = None
-embed_model = None
-reranker_tokenizer = None
-reranker_model = None
 
 INDEX_Q_PATH = "index_q.faiss"
 INDEX_QA_PATH = "index_qa.faiss"
 PARQUET_PATH = "qa_pool.parquet"
 EMBED_MODEL_NAME = "BAAI/bge-m3"
-RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+HF_INFERENCE_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBED_MODEL_NAME}"
+
+def get_query_embedding(query_text: str) -> np.ndarray:
+    """Get embedding from HuggingFace Inference API (same model as FAISS index was built with)."""
+    hf_token = os.environ.get("HF_TOKEN", "")
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+    payload = {"inputs": f"query: {query_text}", "options": {"wait_for_model": True}}
+    response = requests.post(HF_INFERENCE_URL, headers=headers, json=payload, timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(f"HF Inference API error {response.status_code}: {response.text}")
+    embedding = np.array(response.json(), dtype="float32")
+    # bge-m3 returns [batch, seq_len, dim] - take mean pool or first token
+    if embedding.ndim == 3:
+        embedding = embedding.mean(axis=1)  # mean pooling
+    if embedding.ndim == 2:
+        embedding = embedding[0]  # first (only) batch item
+    # Normalize
+    norm = np.linalg.norm(embedding)
+    if norm > 0:
+        embedding = embedding / norm
+    return embedding
 
 @app.on_event("startup")
 def startup_event():
-    global df, index_q, index_qa, bm25, embed_model, reranker_tokenizer, reranker_model
+    global df, index_q, index_qa, bm25
     print("=" * 60)
     print("🚀 INITIALIZING HINDI RAG ENGINE (NATIVE FAISS + PARQUET)...")
     print("=" * 60)
@@ -99,7 +113,6 @@ def startup_event():
 
     # 2. Load Native FAISS Indexes
     print(f"⚡ Loading native FAISS indexes...")
-    print(f"⚡ Loading native FAISS indexes ({INDEX_Q_PATH}, {INDEX_QA_PATH})...")
     index_q = faiss.read_index(INDEX_Q_PATH)
     index_qa = faiss.read_index(INDEX_QA_PATH)
 
@@ -108,18 +121,8 @@ def startup_event():
     tokenized_queries = [q.split() for q in df["query"].tolist()]
     bm25 = BM25Okapi(tokenized_queries)
 
-    # 4. Load SentenceTransformer Model
-    print(f"🧠 Loading Embedding Model ({EMBED_MODEL_NAME})...")
-    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-
-    # 5. Load Cross-Encoder Re-ranker
-    print(f"🎯 Loading Cross-Encoder Re-ranker ({RERANKER_MODEL_NAME})...")
-    reranker_tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_NAME)
-    reranker_model = AutoModelForSequenceClassification.from_pretrained(RERANKER_MODEL_NAME).to("cpu")
-    reranker_model.eval()
-
     print("=" * 60)
-    print("✅ HINDI RAG ENGINE READY ON http://localhost:8000")
+    print(f"✅ HINDI RAG ENGINE READY — embeddings via HF Inference API ({EMBED_MODEL_NAME})")
     print("=" * 60)
 
 class QueryRequest(BaseModel):
@@ -174,14 +177,15 @@ def ask_question(req: QueryRequest):
     if not query_text:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    if index_q is None or embed_model is None:
-        raise HTTPException(status_code=500, detail="RAG Engine components are not initialized.")
+    if index_q is None or df is None:
+        raise HTTPException(status_code=500, detail="RAG Engine not initialized.")
 
     t0_rag = time.perf_counter()
 
     try:
-        # 1. Embed query
-        q_emb = embed_model.encode([f"query: {query_text}"], normalize_embeddings=True)
+        # 1. Embed query via HF Inference API
+        q_emb = get_query_embedding(query_text)
+        q_emb = np.array([q_emb], dtype="float32")
 
         # 2. Hybrid Search (Dense FAISS + BM25)
         rerank_k = max(req.k, 5)
@@ -203,30 +207,16 @@ def ask_question(req: QueryRequest):
         top_candidate_indices = np.argsort(rrf_scores)[::-1][:rerank_k]
         candidate_results = [df.iloc[int(i)] for i in top_candidate_indices]
 
-        # 3. Cross-Encoder Re-ranking
-        passages = [f"{doc['query']} {doc['answer']}" for doc in candidate_results]
-        features = reranker_tokenizer(
-            [query_text] * len(passages), passages,
-            padding=True, truncation=True, return_tensors='pt'
-        ).to('cpu')
-
-        with torch.no_grad():
-            logits = reranker_model(**features).logits.view(-1)
-        raw_scores = logits.tolist()
-        probs = [1.0 / (1.0 + math.exp(-s)) for s in raw_scores]
-
+        # 3. Use RRF scores directly (no reranker needed)
         retrieved_docs = []
-        for i, (raw, prob) in enumerate(zip(raw_scores, probs)):
-            cand = candidate_results[i].to_dict()
+        for rank, idx in enumerate(top_candidate_indices):
+            cand = candidate_results[rank].to_dict()
             retrieved_docs.append({
                 "query": cand["query"],
-                "matched_question": cand["query"],  # Map query to matched_question for compatibility
+                "matched_question": cand["query"],
                 "answer": cand["answer"],
-                "score": float(prob),
-                "raw_score": float(raw)
+                "score": float(rrf_scores[idx]),
             })
-
-        retrieved_docs.sort(key=lambda x: x["score"], reverse=True)
         retrieved_docs = retrieved_docs[:req.k]
 
         retrieval_latency = (time.perf_counter() - t0_rag) * 1000
