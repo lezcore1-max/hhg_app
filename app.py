@@ -74,7 +74,7 @@ INDEX_Q_PATH = "index_q.faiss"
 INDEX_QA_PATH = "index_qa.faiss"
 PARQUET_PATH = "qa_pool.parquet"
 EMBED_MODEL_NAME = "BAAI/bge-m3"
-HF_INFERENCE_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBED_MODEL_NAME}"
+HF_INFERENCE_URL = f"https://router.huggingface.co/hf-inference/models/{EMBED_MODEL_NAME}"
 
 def get_query_embedding(query_text: str) -> np.ndarray:
     """Get embedding from HuggingFace Inference API (same model as FAISS index was built with)."""
