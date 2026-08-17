@@ -74,28 +74,20 @@ INDEX_Q_PATH = "index_q.faiss"
 INDEX_QA_PATH = "index_qa.faiss"
 PARQUET_PATH = "qa_pool.parquet"
 EMBED_MODEL_NAME = "BAAI/bge-m3"
-HF_INFERENCE_URL = f"https://router.huggingface.co/hf-inference/models/{EMBED_MODEL_NAME}"
+from huggingface_hub import InferenceClient
 
 def get_query_embedding(query_text: str) -> np.ndarray:
-    """Get embedding from HuggingFace Inference API (same model as FAISS index was built with)."""
+    """Get embedding from HuggingFace Inference API using official InferenceClient."""
     hf_token = os.environ.get("HF_TOKEN", "")
-    headers = {
-        "x-use-pipeline": "feature-extraction"
-    }
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-
-    payload = {"inputs": f"query: {query_text}", "options": {"wait_for_model": True}}
-    response = requests.post(HF_INFERENCE_URL, headers=headers, json=payload, timeout=30)
-    if response.status_code != 200:
-        raise RuntimeError(f"HF Inference API error {response.status_code}: {response.text}")
-    embedding = np.array(response.json(), dtype="float32")
-    # bge-m3 returns [batch, seq_len, dim] - take mean pool or first token
-    if embedding.ndim == 3:
-        embedding = embedding.mean(axis=1)  # mean pooling
+    client = InferenceClient(api_key=hf_token) if hf_token else InferenceClient()
+    
+    emb = client.feature_extraction(f"query: {query_text}", model=EMBED_MODEL_NAME)
+    embedding = np.array(emb, dtype="float32")
     if embedding.ndim == 2:
-        embedding = embedding[0]  # first (only) batch item
-    # Normalize
+        embedding = embedding.mean(axis=0)
+    elif embedding.ndim == 3:
+        embedding = embedding[0].mean(axis=0)
+        
     norm = np.linalg.norm(embedding)
     if norm > 0:
         embedding = embedding / norm
