@@ -126,16 +126,34 @@ class QueryRequest(BaseModel):
     query: str
     k: int = 5
 
-def guardrail_check(query_text: str, top_results: list):
+def guardrail_check(query_text: str, top_results: list, rrf_threshold: float = 0.01, semantic_sim_threshold: float = 0.50):
     if not top_results:
-        return {"should_answer": False, "reason": "no_results"}
+        return {"should_answer": False, "reason": "no_results", "top_score": 0.0, "semantic_sim": 0.0}
 
     top = top_results[0]
+    if top["score"] < rrf_threshold:
+        return {"should_answer": False, "reason": "low_confidence_off_topic", "top_score": top["score"], "semantic_sim": 0.0}
+
+    try:
+        q_emb = get_query_embedding(query_text)
+        mq_emb = get_query_embedding(top['query'])
+        semantic_sim = float(np.dot(q_emb, mq_emb))
+    except Exception:
+        semantic_sim = 1.0
+
+    if semantic_sim < semantic_sim_threshold:
+        return {
+            "should_answer": False,
+            "reason": "semantic_mismatch",
+            "top_score": top["score"],
+            "semantic_sim": round(semantic_sim, 3),
+        }
+
     return {
         "should_answer": True,
         "reason": "grounded",
         "top_score": top["score"],
-        "semantic_sim": 1.0,
+        "semantic_sim": round(semantic_sim, 3),
         "grounded_answer": top["answer"],
         "retrieved_context": top_results,
     }
