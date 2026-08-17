@@ -1,7 +1,5 @@
 FROM python:3.11-slim
 
-# HuggingFace Spaces runs as user 1000
-RUN useradd -m -u 1000 user
 WORKDIR /app
 
 # Install system deps
@@ -13,16 +11,9 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app and data files
+# Copy only app.py — data files are auto-downloaded from HuggingFace Hub at startup
 COPY app.py .
-COPY qa_pool.parquet .
-COPY index_q.faiss .
-COPY index_qa.faiss .
-COPY .env .
 
-# Switch to non-root user
-USER user
-
-EXPOSE $PORT
+EXPOSE 8000
 
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
