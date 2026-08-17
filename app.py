@@ -276,48 +276,37 @@ from fastapi import UploadFile, File
 
 @app.post("/voice-ask")
 async def voice_ask_question(file: UploadFile = File(...)):
-    """Accepts an audio file upload (WAV/MP3), transcribes via SarvamAI SDK (saaras:v3), and runs RAG + Gemini."""
-    SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-    if not SARVAM_API_KEY:
-        raise HTTPException(status_code=500, detail="SARVAM_API_KEY is not set in environment or .env file.")
+    """Accepts an audio file upload (WAV/WEBM/MP3), transcribes via Sarvam STT API (saaras:v3), and runs RAG + Gemini."""
+    SARVAM_API_KEY = os.getenv("SARVAM_API_KEY") or "sk_br0jc2cj_aHhpyDZm67tm7K6rhAkRAj4Y"
 
     t0_voice = time.perf_counter()
     stt_t0 = time.perf_counter()
     transcript = ""
 
-    # Save uploaded bytes to a temporary audio file on disk
     temp_path = f"temp_{file.filename}"
     try:
+        audio_bytes = await file.read()
         with open(temp_path, "wb") as f:
-            f.write(await file.read())
+            f.write(audio_bytes)
 
-        # Attempt transcription via SarvamAI SDK
-        try:
-            from sarvamai import SarvamAI
-            client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
-            with open(temp_path, "rb") as audio_file:
-                stt_res = client.speech_to_text.transcribe(
-                    file=audio_file,
-                    model="saaras:v3",
-                    mode="transcribe"
-                )
-            # Retrieve transcript property or dict key
-            transcript = getattr(stt_res, "transcript", "") or (stt_res.get("transcript", "") if isinstance(stt_res, dict) else "")
+        # Transcribe audio using Sarvam STT REST API
+        url = "https://api.sarvam.ai/speech-to-text"
+        headers = {"api-subscription-key": SARVAM_API_KEY}
+        
+        content_type = file.content_type or "audio/webm"
+        with open(temp_path, "rb") as audio_file:
+            files = {"file": (file.filename, audio_file, content_type)}
+            data = {"model": "saaras:v3"}
+            res = requests.post(url, headers=headers, files=files, data=data, timeout=15)
 
-        except ImportError:
-            # Fallback to direct HTTP request if sarvamai SDK is not installed
-            import requests
-            url = "https://api.sarvam.ai/speech-to-text"
-            headers = {"api-subscription-key": SARVAM_API_KEY}
-            with open(temp_path, "rb") as audio_file:
-                files = {"file": (file.filename, audio_file, file.content_type or "audio/wav")}
-                data = {"model": "saaras:v3", "mode": "transcribe"}
-                res = requests.post(url, headers=headers, files=files, data=data)
-            if res.status_code == 200:
-                transcript = res.json().get("transcript", "")
-            else:
-                raise HTTPException(status_code=500, detail=f"Sarvam STT failed [{res.status_code}]: {res.text}")
+        if res.status_code == 200:
+            transcript = res.json().get("transcript", "")
+        else:
+            print(f"⚠️ Sarvam STT Error ({res.status_code}): {res.text}")
+            raise HTTPException(status_code=400, detail=f"Sarvam STT failed: {res.json().get('error', {}).get('message', res.text)}")
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Voice processing error: {str(e)}")
     finally:
