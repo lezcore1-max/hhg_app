@@ -252,20 +252,30 @@ Provided Documents:
 Your Answer:
 """
 
-        # 6. Call Gemini 3.1 Flash Lite LLM
+        # 6. Call Gemini 3.1 Flash Lite LLM with streaming to measure TTFT (Time-To-First-Token)
         model_gemini = genai.GenerativeModel('gemini-3.1-flash-lite')
-        response = model_gemini.generate_content(prompt)
+        t_llm_0 = time.perf_counter()
+        response_stream = model_gemini.generate_content(prompt, stream=True)
+        
+        full_text = ""
+        ttft_ms = None
+        for chunk in response_stream:
+            if ttft_ms is None:
+                ttft_ms = (time.perf_counter() - t_llm_0) * 1000  # Time To First Token
+            if chunk.text:
+                full_text += chunk.text
 
         total_latency = (time.perf_counter() - t0_rag) * 1000
 
         return {
             "query": query_text,
-            "answer": response.text.strip(),
+            "answer": full_text.strip(),
             "status": "answered_by_llm",
             "confidence": check["top_score"],
             "semantic_sim": check["semantic_sim"],
             "retrieved_context": check["retrieved_context"],
             "retrieval_latency_ms": round(retrieval_latency, 2),
+            "llm_latency_ms": round(ttft_ms or 0, 2),
             "total_latency_ms": round(total_latency, 2)
         }
 
