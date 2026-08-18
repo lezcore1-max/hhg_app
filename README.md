@@ -32,11 +32,18 @@ cp .env.example .env
 # Fill in your SARVAM_API_KEY and GEMINI_API_KEY in .env
 ```
 
-### 3. Place data files in root
-You need these 3 files in the same directory as `app.py`:
-- `index_q.faiss`
-- `index_qa.faiss`
-- `qa_pool.parquet`
+### 3. Data Indexes (`index_q.faiss`, `index_qa.faiss`, `qa_pool.parquet`)
+
+The RAG engine requires 3 index files to run:
+- `index_q.faiss` — FAISS vector index of 13,312 query embeddings
+- `index_qa.faiss` — FAISS vector index of question+answer embeddings
+- `qa_pool.parquet` — Full dataset pool containing queries, contexts, and answers
+
+**⚡ Automatic Download (Default):**
+When `app.py` runs, it automatically downloads all 3 files from HuggingFace Hub repository [`lezcore1-max/tilt-rag-data`](https://huggingface.co/datasets/lezcore1-max/tilt-rag-data) on startup if they are not already present locally.
+
+**📦 Manual Placement (Optional):**
+If you prefer offline setup, download the 3 files from [`lezcore1-max/tilt-rag-data`](https://huggingface.co/datasets/lezcore1-max/tilt-rag-data) and place them directly in the root project directory alongside `app.py`.
 
 ### 4. Run
 ```bash
