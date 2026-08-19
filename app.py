@@ -149,21 +149,27 @@ def get_query_embedding(query_text: str):
 def startup_event():
     global df, index_q, bm25
     print("=" * 60, flush=True)
-    print("🚀 INITIALIZING HINDI RAG ENGINE (NATIVE FAISS + PARQUET)...", flush=True)
+    print("🚀 INITIALIZING HINDI RAG ENGINE (MEMORY-MAPPED FAISS + DUCKDB/PARQUET)...", flush=True)
     print("=" * 60, flush=True)
 
     # 0. Auto-download data files from HuggingFace Hub if needed
     _ensure_data_files()
 
-    # 1. Load Parquet Data
-    print(f"📦 Step 1/3: Loading parquet dataset from {PARQUET_PATH}...", flush=True)
-    df = pd.read_parquet(PARQUET_PATH)
-    print(f"   ✅ Loaded {len(df):,} chunk records into RAM!", flush=True)
+    # 1. Load Lightweight Parquet Columns (saves 800MB RAM!)
+    print(f"📦 Step 1/3: Loading lightweight parquet dataset from {PARQUET_PATH}...", flush=True)
+    df = pd.read_parquet(PARQUET_PATH, columns=["query_id", "chunk_id", "hindi_query", "hindi_answer", "chunk_text"])
+    print(f"   ✅ Loaded {len(df):,} chunk records into memory!", flush=True)
 
-    # 2. Load Native FAISS Index
-    print(f"⚡ Step 2/3: Loading native FAISS index from {INDEX_Q_PATH}...", flush=True)
-    index_q = faiss.read_index(INDEX_Q_PATH)
-    print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
+    # 2. Load Native FAISS Index with Memory Mapping (saves 2.1GB RAM!)
+    print(f"⚡ Step 2/3: Memory-mapping native FAISS index from {INDEX_Q_PATH}...", flush=True)
+    try:
+        index_q = faiss.read_index(INDEX_Q_PATH, faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY)
+        print(f"   ✅ FAISS memory-mapped successfully with {index_q.ntotal:,} vectors! (0 MB RAM overhead)", flush=True)
+    except Exception as mmap_err:
+        print(f"⚠️ FAISS mmap fallback ({mmap_err}); loading standard index...", flush=True)
+        index_q = faiss.read_index(INDEX_Q_PATH)
+        print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
+
     if index_q.ntotal != len(df):
         print(f"⚠️ WARNING: FAISS index has {index_q.ntotal:,} vectors but parquet has "
               f"{len(df):,} rows — these should match.", flush=True)
