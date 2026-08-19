@@ -173,7 +173,8 @@ def get_query_embedding(query_text: str):
         arr = arr[0]
         
         norm = np.linalg.norm(arr)
-        return (arr / norm) if norm > 0 else arr
+        res = (arr / norm) if norm > 0 else arr
+        return res.astype(np.float32)
     except Exception as e:
         print(f"⚠️ get_query_embedding error: {e}", flush=True)
         return None
@@ -349,6 +350,8 @@ async def ask_question(req: QueryRequest):
         
         try:
             if q_emb is not None:
+                q_emb = np.array(q_emb, dtype=np.float32)
+                
                 if mmap_vectors is not None:
                     # 153 MB RAM vector dot product!
                     # Calculate in chunks to prevent NumPy from silently allocating a 750 MB float32 temporary matrix
