@@ -3,10 +3,15 @@ import sys
 import time
 import uuid
 import asyncio
+import threading
 import numpy as np
 import pandas as pd
 import httpx
+import requests
+import pyarrow.dataset as ds
+from dotenv import load_dotenv
 
+# ── Windows UTF-8 console fix ──────────────────────────────────────────────
 if sys.platform.startswith("win"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -14,72 +19,28 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
+# ── Load environment variables ──────────────────────────────────────────────
+load_dotenv()
+
 from google import genai
 from google.genai import types
 import websockets
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from rank_bm25 import BM25Okapi
 import faiss
 
+# ── Configuration Constants ──────────────────────────────────────────────────
 HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "lezcore1-max/tilt-rag-data")
-
-# Persistent data directory — use Railway Volume (/app/data) if available, else current dir
 DATA_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.isdir("/app/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 print(f"[INIT] Using data directory: {DATA_DIR}", flush=True)
 
-
-def _download_file_with_progress(url: str, dest_path: str, fname: str):
-    """Download a file via HTTP with live MB progress logging for cloud containers."""
-    import requests
-    response = requests.get(url, stream=True, timeout=60)
-    response.raise_for_status()
-    total_size = int(response.headers.get('content-length', 0))
-    total_mb = total_size / (1024 * 1024)
-    
-    downloaded = 0
-    last_log_mb = 0
-    with open(dest_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
-            if chunk:
-                f.write(chunk)
-                downloaded += len(chunk)
-                current_mb = downloaded / (1024 * 1024)
-                if current_mb - last_log_mb >= 50 or downloaded == total_size:
-                    pct = (downloaded / total_size * 100) if total_size > 0 else 0
-                    print(f"   ⬇️ {fname}: {current_mb:.1f} MB / {total_mb:.1f} MB ({pct:.1f}%)", flush=True)
-                    last_log_mb = current_mb
-
-
-def _ensure_data_files():
-    """Download FAISS index and Parquet from HuggingFace Hub with live MB logs."""
-    files_needed = ["small_hindi_passages.faiss", "chunks_for_embedding.parquet"]
-    missing = [f for f in files_needed if not os.path.exists(os.path.join(DATA_DIR, f))]
-    if not missing:
-        print(f"✅ All required data files already exist in {DATA_DIR}. Skipping download.", flush=True)
-        return
-        
-    print(f"⬇️ Data files missing: {missing}. Downloading from HuggingFace Hub ({HF_DATASET_REPO})...", flush=True)
-    for fname in missing:
-        url = f"https://huggingface.co/datasets/{HF_DATASET_REPO}/resolve/main/{fname}"
-        dest_path = os.path.join(DATA_DIR, fname)
-        print(f"   ⏳ Starting download for {fname} -> {dest_path}...", flush=True)
-        try:
-            _download_file_with_progress(url, dest_path, fname)
-            print(f"   ✅ {fname} ready!", flush=True)
-        except Exception as e:
-            print(f"⚠️ Direct download failed for {fname} ({e}), trying fallback hf_hub_download...", flush=True)
-            from huggingface_hub import hf_hub_download
-            hf_hub_download(repo_id=HF_DATASET_REPO, filename=fname, repo_type="dataset", local_dir=DATA_DIR)
-            print(f"   ✅ {fname} ready via fallback!", flush=True)
-
-
-
-# ── Load environment variables ──────────────────────────────────────────────
-load_dotenv()
+INDEX_Q_PATH = os.path.join(DATA_DIR, "small_hindi_passages.faiss")
+PARQUET_PATH = os.path.join(DATA_DIR, "chunks_for_embedding.parquet")
+EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"  # 384-dim lightweight embedding model
+VECTOR_DIM = 384  # multilingual-e5-small output dimension
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if GEMINI_API_KEY:
@@ -92,14 +53,13 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 if not SARVAM_API_KEY:
     print("⚠️ WARNING: SARVAM_API_KEY not found — /voice-ask and /ws/sarvam will fail until it is set.", flush=True)
 
-# Comma-separated list of allowed origins, e.g. "https://myapp.com,https://www.myapp.com"
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 
-# ── FastAPI app ──────────────────────────────────────────────────────────────
+# ── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Enterprise Hindi RAG QA Engine",
-    description="High-performance hybrid retrieval (FAISS + BM25) powered by Gemini 3.1 Flash Lite",
-    version="2.1.0"
+    description="High-performance hybrid retrieval (FAISS + BM25) powered by intfloat/multilingual-e5-small and Gemini 3.1 Flash Lite",
+    version="2.2.0"
 )
 
 app.add_middleware(
@@ -110,50 +70,109 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables for loaded RAG assets
+# ── Global Engine State ──────────────────────────────────────────────────────
 df_queries = None
 parquet_dataset = None
 mmap_vectors = None
 index_q = None
 bm25 = None
-
-INDEX_Q_PATH = os.path.join(DATA_DIR, "small_hindi_passages.faiss")
-PARQUET_PATH = os.path.join(DATA_DIR, "chunks_for_embedding.parquet")
-EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"  # 384-dim, lightweight
-VECTOR_DIM = 384  # multilingual-e5-small output dimension
+_engine_ready = False
+_engine_error = None
 
 
+# ── Data Download Utility ───────────────────────────────────────────────────
+def _ensure_data_files():
+    """Download FAISS index and Parquet from HuggingFace Hub with fast download."""
+    from huggingface_hub import hf_hub_download
 
+    # Clean up old large 2GB FAISS index if present to free disk space
+    old_files = ["hindi_passages.faiss"]
+    for old_f in old_files:
+        old_path = os.path.join(DATA_DIR, old_f)
+        if os.path.exists(old_path):
+            print(f"🧹 Removing old file {old_f} to free disk space...", flush=True)
+            try:
+                os.remove(old_path)
+                print(f"   ✅ Removed {old_f}", flush=True)
+            except Exception as e:
+                print(f"   ⚠️ Could not remove {old_f}: {e}", flush=True)
+
+    expected_min_sizes = {
+        "small_hindi_passages.faiss": 700 * 1024 * 1024,  # ~782.8 MB
+        "chunks_for_embedding.parquet": 100 * 1024 * 1024  # ~149.5 MB
+    }
+
+    files_needed = ["small_hindi_passages.faiss", "chunks_for_embedding.parquet"]
+    for fname in files_needed:
+        fpath = os.path.join(DATA_DIR, fname)
+        min_sz = expected_min_sizes.get(fname, 0)
+        if not os.path.exists(fpath) or os.path.getsize(fpath) < min_sz:
+            if os.path.exists(fpath):
+                print(f"⚠️ Existing {fname} is incomplete ({os.path.getsize(fpath):,} bytes < {min_sz:,} bytes). Re-downloading...", flush=True)
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+            print(f"⬇️ Downloading {fname} from HuggingFace Hub ({HF_DATASET_REPO})...", flush=True)
+            hf_hub_download(
+                repo_id=HF_DATASET_REPO,
+                filename=fname,
+                repo_type="dataset",
+                local_dir=DATA_DIR,
+                token=os.getenv("HF_TOKEN")
+            )
+            print(f"   ✅ {fname} ready ({os.path.getsize(fpath):,} bytes)!", flush=True)
+        else:
+            print(f"✅ {fname} exists ({os.path.getsize(fpath):,} bytes). Skipping download.", flush=True)
+
+
+# ── Query Embedding (intfloat/multilingual-e5-small) ──────────────────────────
 def get_query_embedding(query_text: str):
-    """Lightweight query embedding via HF Inference API (intfloat/multilingual-e5-small, 384-dim)."""
+    """
+    Generate 384-dim query embedding via HF Inference API for intfloat/multilingual-e5-small.
+    Uses 'query: <text>' prefix as expected by the e5 model family.
+    """
     hf_token = os.environ.get("HF_TOKEN", "")
+    input_text = f"query: {query_text}"
+
+    # 1. Try Hugging Face InferenceClient
     try:
-        import requests
-        url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBED_MODEL_NAME}"
-        headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
-        res = requests.post(url, headers=headers, json={"inputs": f"query: {query_text}"}, timeout=10)
-        
-        if res.status_code != 200:
-            print(f"⚠️ get_query_embedding HTTP {res.status_code}: {res.text}", flush=True)
-            return None
-            
-        emb = res.json()
+        from huggingface_hub import InferenceClient
+        client = InferenceClient(api_key=hf_token)
+        emb = client.feature_extraction(input_text, model=EMBED_MODEL_NAME)
         arr = np.array(emb, dtype="float32")
-        
         if arr.ndim == 2:
             arr = arr.mean(axis=0)
         elif arr.ndim == 3:
             arr = arr[0].mean(axis=0)
-            
         norm = np.linalg.norm(arr)
         return (arr / norm) if norm > 0 else arr
-    except Exception as e:
-        print(f"⚠️ get_query_embedding error: {e}", flush=True)
-        return None
+    except Exception as e1:
+        print(f"⚠️ InferenceClient embedding fallback ({e1}), trying direct HTTP...", flush=True)
+
+    # 2. Try Direct HTTP REST API
+    try:
+        url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBED_MODEL_NAME}"
+        headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+        res = requests.post(url, headers=headers, json={"inputs": input_text}, timeout=15)
+        if res.status_code == 200:
+            emb = res.json()
+            arr = np.array(emb, dtype="float32")
+            if arr.ndim == 2:
+                arr = arr.mean(axis=0)
+            elif arr.ndim == 3:
+                arr = arr[0].mean(axis=0)
+            norm = np.linalg.norm(arr)
+            return (arr / norm) if norm > 0 else arr
+        else:
+            print(f"⚠️ Direct HF API error HTTP {res.status_code}: {res.text}", flush=True)
+    except Exception as e2:
+        print(f"⚠️ Direct HTTP embedding error: {e2}", flush=True)
+
+    return None
 
 
-import pyarrow.dataset as ds
-
+# ── On-Demand Disk Streaming for Parquet Rows (0 MB RAM) ─────────────────────
 def fetch_candidate_rows_on_demand(top_indices: list):
     """Fetch ONLY the top retrieved candidate rows directly from disk without RAM footprint."""
     if not top_indices or parquet_dataset is None:
@@ -170,13 +189,7 @@ def fetch_candidate_rows_on_demand(top_indices: list):
         return {}
 
 
-import threading
-
-# Track engine readiness (set to True once all data is loaded)
-_engine_ready = False
-_engine_error = None
-
-
+# ── Background Engine Initialization ─────────────────────────────────────────
 def _load_rag_engine_background():
     """Run all heavy data loading in a background thread so FastAPI starts instantly."""
     global df_queries, parquet_dataset, mmap_vectors, index_q, bm25, _engine_ready, _engine_error
@@ -188,14 +201,14 @@ def _load_rag_engine_background():
         # 0. Auto-download data files from HuggingFace Hub if needed
         _ensure_data_files()
 
-        # 1. Load Parquet Dataset Handle & 1 Lightweight Column
+        # 1. Load Parquet Dataset Handle & 1 Lightweight Column (~55 MB RAM total)
         print(f"📦 Step 1/3: Loading 1-column query index from {PARQUET_PATH}...", flush=True)
         parquet_dataset = ds.dataset(PARQUET_PATH, format="parquet")
         df_queries = pd.read_parquet(PARQUET_PATH, columns=["hindi_query"])
         total_records = len(df_queries)
         print(f"   ✅ Loaded {total_records:,} query strings into RAM (~55 MB RAM total)!", flush=True)
 
-        # 2. Memory-Map Vector Matrix (0 MB RAM overhead!)
+        # 2. Memory-Map 384-dim Vector Matrix (0 MB RAM overhead!)
         print(f"⚡ Step 2/3: Memory-mapping vector matrix from {INDEX_Q_PATH} (dim={VECTOR_DIM})...", flush=True)
         try:
             mmap_vectors = np.memmap(INDEX_Q_PATH, dtype="float32", mode="r", offset=45, shape=(total_records, VECTOR_DIM))
@@ -205,14 +218,14 @@ def _load_rag_engine_background():
             index_q = faiss.read_index(INDEX_Q_PATH)
             print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
 
-        # 3. Build BM25 Index
+        # 3. Build BM25 Index over hindi_query
         print("🔍 Step 3/3: Building BM25 keyword index...", flush=True)
         tokenized_queries = [str(q).split() for q in df_queries["hindi_query"].tolist()]
         bm25 = BM25Okapi(tokenized_queries)
 
         _engine_ready = True
         print("=" * 60, flush=True)
-        print(f"🎯 HHG RAG ENGINE READY — {total_records:,} chunks indexed!", flush=True)
+        print(f"🎯 HHG RAG ENGINE READY — {total_records:,} chunks indexed ({EMBED_MODEL_NAME})!", flush=True)
         print("=" * 60, flush=True)
 
     except Exception as e:
@@ -228,14 +241,14 @@ def startup_event():
     t.start()
 
 
-
+# ── Request / Guardrail Schemas ──────────────────────────────────────────────
 class QueryRequest(BaseModel):
     query: str
     k: int = 5
 
 
 def guardrail_check(top_results: list, query_embedding: np.ndarray | None,
-                     rrf_threshold: float = 0.01, semantic_sim_threshold: float = 0.50):
+                     rrf_threshold: float = 0.01, semantic_sim_threshold: float = 0.45):
     if not top_results:
         return {"should_answer": False, "reason": "no_results", "top_score": 0.0, "semantic_sim": 0.0}
 
@@ -270,15 +283,21 @@ def guardrail_check(top_results: list, query_embedding: np.ndarray | None,
     }
 
 
+# ── API Endpoints ────────────────────────────────────────────────────────────
 @app.get("/")
 @app.get("/health")
 def health_check():
-    """Always returns 200 OK immediately — Railway healthcheck safe."""
+    """Always returns 200 OK immediately — cloud container healthcheck safe."""
     if _engine_ready:
         return {
             "status": "ready",
-            "engine": "Hindi RAG QA Engine v2.1",
+            "engine": "Hindi RAG QA Engine v2.2",
             "records_indexed": len(df_queries) if df_queries is not None else 0,
+            "models": {
+                "embedding": EMBED_MODEL_NAME,
+                "dimension": VECTOR_DIM,
+                "llm": "gemini-3.1-flash-lite"
+            }
         }
     elif _engine_error:
         return {"status": "error", "detail": _engine_error}
@@ -293,12 +312,11 @@ async def ask_question(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
     if not _engine_ready:
-        msg = f"Engine loading: {_engine_error}" if _engine_error else "RAG engine is still loading, please retry in a moment."
+        msg = f"Engine loading error: {_engine_error}" if _engine_error else "RAG engine is still loading, please retry in a moment."
         raise HTTPException(status_code=503, detail=msg)
 
     if (mmap_vectors is None and index_q is None) or df_queries is None:
         raise HTTPException(status_code=503, detail="RAG Engine not initialized.")
-
 
     t0_rag = time.perf_counter()
 
@@ -309,7 +327,7 @@ async def ask_question(req: QueryRequest):
         dense_scores = []
         dense_score_map = {}
         q_emb = get_query_embedding(query_text)
-        
+
         try:
             if q_emb is not None:
                 if mmap_vectors is not None:
@@ -363,16 +381,16 @@ async def ask_question(req: QueryRequest):
         for rank, idx in enumerate(top_candidate_indices):
             idx_int = int(idx)
             cand = candidate_rows_map.get(idx_int, {})
-            
+
             if idx_int in dense_score_map:
                 score_val = float(dense_score_map[idx_int])
             else:
                 bm25_norm = float(bm25_score_map.get(idx_int, 0.0)) / max_bm25 if max_bm25 > 0 else 0.5
                 score_val = 0.52 + (bm25_norm * 0.33)
-            
+
             chunk_identifier = str(cand.get("chunk_id") or f"{cand.get('query_id', idx_int)}#0")
             passage_identifier = str(cand.get("query_id") or cand.get("passage_id") or idx_int)
-            
+
             retrieved_docs.append({
                 "chunk_id": chunk_identifier,
                 "passage_id": passage_identifier,
@@ -388,7 +406,7 @@ async def ask_question(req: QueryRequest):
 
         retrieval_latency = (time.perf_counter() - t0_rag) * 1000
 
-        # 4. Guardrail Check
+        # 5. Guardrail Check
         check = guardrail_check(retrieved_docs, q_emb)
 
         if not check["should_answer"]:
@@ -403,7 +421,7 @@ async def ask_question(req: QueryRequest):
                 "total_latency_ms": round(total_latency, 2)
             }
 
-        # 5. Build Compact Grounded Prompt for Gemini LLM
+        # 6. Build Compact Grounded Prompt for Gemini LLM
         context_docs = "\n\n".join(
             f"Q: {doc['query']}\nA: {doc['answer']}"
             for doc in check["retrieved_context"][:3]
@@ -415,7 +433,7 @@ async def ask_question(req: QueryRequest):
 User Question: {query_text}
 Answer:"""
 
-        # 6. Call Gemini 3.1 Flash Lite for low-latency grounded generation
+        # 7. Call Gemini 3.1 Flash Lite for low-latency grounded generation
         if gemini_client is None:
             raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
 
@@ -487,7 +505,6 @@ async def voice_ask_question(file: UploadFile = File(...)):
     stt_t0 = time.perf_counter()
     transcript = ""
 
-    # Unique temp filename to avoid collisions between concurrent requests
     safe_suffix = os.path.splitext(file.filename or "audio")[-1] or ".webm"
     temp_path = f"temp_{uuid.uuid4().hex}{safe_suffix}"
 
@@ -511,7 +528,6 @@ async def voice_ask_question(file: UploadFile = File(...)):
         else:
             content_type = raw_ct.split(";")[0].strip()
 
-        # Async HTTP call so this doesn't block the event loop under concurrent load
         async with httpx.AsyncClient(timeout=15) as client:
             with open(temp_path, "rb") as audio_file:
                 files = {"file": (file.filename, audio_file, content_type)}
@@ -549,16 +565,15 @@ async def voice_ask_question(file: UploadFile = File(...)):
     return rag_response
 
 
-# ── WebSocket proxy for Sarvam realtime STT ────────────────────────────────
+# ── WebSocket Proxy for Sarvam Realtime STT ──────────────────────────────────
 SARVAM_WS_BASE = "wss://api.sarvam.ai/speech-to-text-realtime/ws"
 
 
 @app.websocket("/ws/sarvam")
 async def sarvam_ws_proxy(client_ws: WebSocket):
     """
-    Proxies the browser WebSocket to Sarvam's realtime streaming endpoint,
-    injecting the Api-Subscription-Key header that browsers can't send.
-    Query params from the client are forwarded as-is to Sarvam.
+    Proxies browser WebSocket to Sarvam's realtime streaming endpoint,
+    injecting the Api-Subscription-Key header that browsers cannot send.
     """
     if not SARVAM_API_KEY:
         await client_ws.close(code=1011, reason="SARVAM_API_KEY not configured on server")
@@ -566,7 +581,6 @@ async def sarvam_ws_proxy(client_ws: WebSocket):
 
     qs = client_ws.url.query
     sarvam_url = f"{SARVAM_WS_BASE}?{qs}" if qs else SARVAM_WS_BASE
-
     headers = {"Api-Subscription-Key": SARVAM_API_KEY}
 
     await client_ws.accept()
