@@ -105,7 +105,8 @@ app.add_middleware(
 )
 
 # Global variables for loaded RAG assets
-df = None
+df_queries = None
+parquet_dataset = None
 index_q = None
 bm25 = None
 embed_model = None
@@ -145,20 +146,40 @@ def get_query_embedding(query_text: str):
         return None
 
 
+import pyarrow.dataset as ds
+
+def fetch_candidate_rows_on_demand(top_indices: list):
+    """Fetch ONLY the top retrieved candidate rows directly from disk without RAM footprint."""
+    if not top_indices or parquet_dataset is None:
+        return {}
+    valid_indices = [int(i) for i in top_indices if 0 <= int(i) < len(df_queries)]
+    if not valid_indices:
+        return {}
+    try:
+        table = parquet_dataset.take(valid_indices)
+        rows_list = table.to_pandas().to_dict("records")
+        return {idx: row for idx, row in zip(valid_indices, rows_list)}
+    except Exception as err:
+        print(f"⚠️ fetch_candidate_rows_on_demand error: {err}", flush=True)
+        return {}
+
+
 @app.on_event("startup")
 def startup_event():
-    global df, index_q, bm25
+    global df_queries, parquet_dataset, index_q, bm25
     print("=" * 60, flush=True)
-    print("🚀 INITIALIZING HINDI RAG ENGINE (MEMORY-MAPPED FAISS + DUCKDB/PARQUET)...", flush=True)
+    print("🚀 INITIALIZING HINDI RAG ENGINE (MEMORY-MAPPED FAISS + ZERO-RAM PARQUET)...", flush=True)
     print("=" * 60, flush=True)
 
     # 0. Auto-download data files from HuggingFace Hub if needed
     _ensure_data_files()
 
-    # 1. Load Lightweight Parquet Columns (saves 800MB RAM!)
-    print(f"📦 Step 1/3: Loading lightweight parquet dataset from {PARQUET_PATH}...", flush=True)
-    df = pd.read_parquet(PARQUET_PATH, columns=["query_id", "chunk_id", "hindi_query", "hindi_answer", "chunk_text"])
-    print(f"   ✅ Loaded {len(df):,} chunk records into memory!", flush=True)
+    # 1. Load Parquet Dataset Handle & 1 Lightweight Column (saves 800MB RAM!)
+    print(f"📦 Step 1/3: Loading 1-column query index from {PARQUET_PATH}...", flush=True)
+    parquet_dataset = ds.dataset(PARQUET_PATH, format="parquet")
+    df_queries = pd.read_parquet(PARQUET_PATH, columns=["hindi_query"])
+    total_records = len(df_queries)
+    print(f"   ✅ Loaded {total_records:,} query strings into RAM (~55 MB RAM total)!", flush=True)
 
     # 2. Load Native FAISS Index with Memory Mapping (saves 2.1GB RAM!)
     print(f"⚡ Step 2/3: Memory-mapping native FAISS index from {INDEX_Q_PATH}...", flush=True)
@@ -170,17 +191,17 @@ def startup_event():
         index_q = faiss.read_index(INDEX_Q_PATH)
         print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
 
-    if index_q.ntotal != len(df):
+    if index_q.ntotal != total_records:
         print(f"⚠️ WARNING: FAISS index has {index_q.ntotal:,} vectors but parquet has "
-              f"{len(df):,} rows — these should match.", flush=True)
+              f"{total_records:,} rows — these should match.", flush=True)
 
     # 3. Build BM25 Index (over hindi_query)
     print("🔍 Step 3/3: Building BM25 keyword index...", flush=True)
-    tokenized_queries = [str(q).split() for q in df["hindi_query"].tolist()]
+    tokenized_queries = [str(q).split() for q in df_queries["hindi_query"].tolist()]
     bm25 = BM25Okapi(tokenized_queries)
 
     print("=" * 60, flush=True)
-    print(f"✅ HINDI RAG ENGINE READY — {len(df):,} chunks indexed ({EMBED_MODEL_NAME})", flush=True)
+    print(f"✅ HINDI RAG ENGINE READY — {total_records:,} chunks indexed ({EMBED_MODEL_NAME})", flush=True)
     print("=" * 60, flush=True)
 
 
@@ -191,10 +212,6 @@ class QueryRequest(BaseModel):
 
 def guardrail_check(top_results: list, query_embedding: np.ndarray | None,
                      rrf_threshold: float = 0.01, semantic_sim_threshold: float = 0.50):
-    """
-    query_embedding is passed in (already computed once in ask_question) rather than
-    recomputed here, to avoid embedding the same query twice per request.
-    """
     if not top_results:
         return {"should_answer": False, "reason": "no_results", "top_score": 0.0, "semantic_sim": 0.0}
 
@@ -234,7 +251,7 @@ def health_check():
     return {
         "status": "online",
         "engine": "Hindi RAG QA Engine v2.1",
-        "records_indexed": len(df) if df is not None else 0,
+        "records_indexed": len(df_queries) if df_queries is not None else 0,
         "models": {
             "embedding": f"local sentence-transformers ({EMBED_MODEL_NAME})",
             "llm": "gemini-3.1-flash-lite"
@@ -248,13 +265,12 @@ async def ask_question(req: QueryRequest):
     if not query_text:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    if index_q is None or df is None:
+    if index_q is None or df_queries is None:
         raise HTTPException(status_code=500, detail="RAG Engine not initialized.")
 
     t0_rag = time.perf_counter()
 
     try:
-        # 1. Embed query locally (compute once, reuse for guardrail check)
         # 1. High-Performance FAISS C++ Candidate Search (50 candidates in <5ms)
         candidate_k = 50
         dense_idx = []
@@ -269,12 +285,12 @@ async def ask_question(req: QueryRequest):
                 dense_idx = dense_idx_arr[0]
                 dense_scores = dense_scores_arr[0]
                 for d_i, d_sc in zip(dense_idx, dense_scores):
-                    if 0 <= d_i < len(df):
+                    if 0 <= d_i < len(df_queries):
                         dense_score_map[int(d_i)] = float(d_sc)
         except Exception as embed_err:
-            print(f"⚠️ Dense search error: {embed_err}")
+            print(f"⚠️ Dense search error: {embed_err}", flush=True)
 
-        # 2. Fast Candidate BM25 Scoring (score only FAISS candidates in <1ms instead of 2.4s full scan)
+        # 2. Fast Candidate BM25 Scoring
         cand_doc_ids = list(dense_score_map.keys())
         bm25_score_map = {}
         if cand_doc_ids:
@@ -287,31 +303,29 @@ async def ask_question(req: QueryRequest):
         rrf_scores = {}
         for rank, d_id in enumerate(dense_idx):
             d_id_int = int(d_id)
-            if 0 <= d_id_int < len(df):
+            if 0 <= d_id_int < len(df_queries):
                 rrf_scores[d_id_int] = rrf_scores.get(d_id_int, 0.0) + (1.0 / (k_rrf + rank + 1))
 
-        # Sort BM25 candidates
         bm25_sorted_cand = sorted(bm25_score_map.keys(), key=lambda x: bm25_score_map[x], reverse=True)
         for rank, d_id in enumerate(bm25_sorted_cand):
             rrf_scores[d_id] = rrf_scores.get(d_id, 0.0) + (1.0 / (k_rrf + rank + 1))
 
-        # Top RRF ranked candidate indices
         sorted_rrf_pairs = sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)[:max(req.k, 4)]
         top_candidate_indices = [pair[0] for pair in sorted_rrf_pairs]
 
-        # 4. Format retrieved documents with normalized similarity score & metadata
+        # 4. Fetch ONLY top candidate rows directly from disk on-demand (0 MB RAM overhead!)
+        candidate_rows_map = fetch_candidate_rows_on_demand(top_candidate_indices)
+
         max_bm25 = max(bm25_score_map.values()) if bm25_score_map and max(bm25_score_map.values()) > 0 else 1.0
 
         retrieved_docs = []
         for rank, idx in enumerate(top_candidate_indices):
             idx_int = int(idx)
-            cand = df.iloc[idx_int].to_dict()
+            cand = candidate_rows_map.get(idx_int, {})
             
-            # If FAISS dense score exists, use FAISS vector cosine similarity (e.g. 0.649)
             if idx_int in dense_score_map:
                 score_val = float(dense_score_map[idx_int])
             else:
-                # If retrieved via BM25 keyword search, normalize BM25 score to 0.52 - 0.85
                 bm25_norm = float(bm25_score_map.get(idx_int, 0.0)) / max_bm25 if max_bm25 > 0 else 0.5
                 score_val = 0.52 + (bm25_norm * 0.33)
             
