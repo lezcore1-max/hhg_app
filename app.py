@@ -80,14 +80,17 @@ app.add_middleware(
 )
 
 # ── Global Engine State ──────────────────────────────────────────────────────
-df_queries = None
-parquet_dataset = None
+corpus_chunk_ids = None
+corpus_queries = None
+corpus_answers = None
+total_records = 0
 mmap_vectors = None
 index_q = None
 bm25 = None
 embed_model = None
 _engine_ready = False
 _engine_error = None
+
 
 
 
@@ -156,10 +159,13 @@ def get_query_embedding(query_text: str):
 
     if embed_model is not None:
         try:
-            emb = embed_model.encode(input_text, normalize_embeddings=True)
+            import torch
+            with torch.inference_mode():
+                emb = embed_model.encode(input_text, normalize_embeddings=True)
             return np.asarray(emb, dtype="float32")
         except Exception as e:
             print(f"⚠️ Local SentenceTransformer encode error: {e}", flush=True)
+
 
     # 2. Fallback: Hugging Face Inference API
     hf_token = os.environ.get("HF_TOKEN", "")
@@ -183,27 +189,10 @@ def get_query_embedding(query_text: str):
 
 
 
-# ── On-Demand Disk Streaming for Parquet Rows (0 MB RAM) ─────────────────────
-def fetch_candidate_rows_on_demand(top_indices: list):
-    """Fetch ONLY the top retrieved candidate rows directly from disk without RAM footprint."""
-    if not top_indices or parquet_dataset is None:
-        return {}
-    valid_indices = [int(i) for i in top_indices if 0 <= int(i) < len(df_queries)]
-    if not valid_indices:
-        return {}
-    try:
-        table = parquet_dataset.take(valid_indices)
-        rows_list = table.to_pandas().to_dict("records")
-        return {idx: row for idx, row in zip(valid_indices, rows_list)}
-    except Exception as err:
-        print(f"⚠️ fetch_candidate_rows_on_demand error: {err}", flush=True)
-        return {}
-
-
 # ── Background Engine Initialization ─────────────────────────────────────────
 def _load_rag_engine_background():
     """Run all heavy data loading in a background thread so FastAPI starts instantly."""
-    global df_queries, parquet_dataset, mmap_vectors, index_q, bm25, _engine_ready, _engine_error
+    global corpus_chunk_ids, corpus_queries, corpus_answers, total_records, mmap_vectors, index_q, bm25, embed_model, _engine_ready, _engine_error
     try:
         print("=" * 60, flush=True)
         print("🚀 INITIALIZING HINDI RAG ENGINE (BACKGROUND THREAD)...", flush=True)
@@ -212,12 +201,15 @@ def _load_rag_engine_background():
         # 0. Auto-download data files from HuggingFace Hub if needed
         _ensure_data_files()
 
-        # 1. Load Parquet Dataset Handle & 1 Lightweight Column (~55 MB RAM total)
-        print(f"📦 Step 1/3: Loading 1-column query index from {PARQUET_PATH}...", flush=True)
-        parquet_dataset = ds.dataset(PARQUET_PATH, format="parquet")
-        df_queries = pd.read_parquet(PARQUET_PATH, columns=["hindi_query"])
-        total_records = len(df_queries)
-        print(f"   ✅ Loaded {total_records:,} query strings into RAM (~55 MB RAM total)!", flush=True)
+        # 1. Load Parquet columns into RAM (~180 MB RAM total, 0.01ms lookup)
+        print(f"📦 Step 1/3: Loading in-memory corpus index from {PARQUET_PATH}...", flush=True)
+        df_records = pd.read_parquet(PARQUET_PATH, columns=["chunk_id", "hindi_query", "hindi_answer"])
+        corpus_chunk_ids = df_records["chunk_id"].tolist()
+        corpus_queries = df_records["hindi_query"].tolist()
+        corpus_answers = df_records["hindi_answer"].tolist()
+        total_records = len(corpus_queries)
+        del df_records  # Free DataFrame memory overhead
+        print(f"   ✅ Loaded {total_records:,} corpus entries into fast RAM lists (0.01ms lookup)!", flush=True)
 
         # 2. Memory-Map 384-dim Vector Matrix (0 MB RAM overhead!)
         print(f"⚡ Step 2/3: Memory-mapping vector matrix from {INDEX_Q_PATH} (dim={VECTOR_DIM})...", flush=True)
@@ -231,27 +223,28 @@ def _load_rag_engine_background():
 
         # 3. Build BM25 Index with script-aware Devanagari tokenization
         print("🔍 Step 3/3: Building Devanagari script-aware BM25 keyword index...", flush=True)
-        tokenized_queries = [tokenize_hindi(q) for q in df_queries["hindi_query"].tolist()]
+        tokenized_queries = [tokenize_hindi(q) for q in corpus_queries]
         bm25 = BM25Okapi(tokenized_queries)
-
 
         # 4. Pre-load and pre-warm local embedding model
         print(f"🧠 Loading and pre-warming {EMBED_MODEL_NAME} embedding model...", flush=True)
         try:
+            import torch
             from sentence_transformers import SentenceTransformer
             embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-            # Warm up JIT / cache so 1st user query takes 15ms instead of 2s
-            embed_model.encode("query: warm up", normalize_embeddings=True)
+            embed_model.eval()
+            with torch.inference_mode():
+                embed_model.encode("query: warm up", normalize_embeddings=True)
             print(f"   ✅ {EMBED_MODEL_NAME} loaded and warmed up locally!", flush=True)
         except Exception as embed_init_err:
             print(f"   ⚠️ Local SentenceTransformer note: {embed_init_err} (will use HF API fallback)", flush=True)
-
 
         _engine_ready = True
 
         print("=" * 60, flush=True)
         print(f"🎯 HHG RAG ENGINE READY — {total_records:,} chunks indexed ({EMBED_MODEL_NAME})!", flush=True)
         print("=" * 60, flush=True)
+
 
     except Exception as e:
         _engine_error = str(e)
@@ -393,15 +386,14 @@ async def ask_question(req: QueryRequest):
         sorted_rrf_pairs = sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)[:max(req.k, 4)]
         top_candidate_indices = [pair[0] for pair in sorted_rrf_pairs]
 
-        # 4. Fetch ONLY top candidate rows directly from disk on-demand (0 MB RAM overhead!)
-        candidate_rows_map = fetch_candidate_rows_on_demand(top_candidate_indices)
-
+        # 4. Instant In-Memory Row Assembly (0.01 ms!)
         max_bm25 = max(bm25_score_map.values()) if bm25_score_map and max(bm25_score_map.values()) > 0 else 1.0
 
         retrieved_docs = []
         for rank, idx in enumerate(top_candidate_indices):
             idx_int = int(idx)
-            cand = candidate_rows_map.get(idx_int, {})
+            if idx_int < 0 or idx_int >= total_records:
+                continue
 
             if idx_int in dense_score_map:
                 score_val = float(dense_score_map[idx_int])
@@ -409,21 +401,23 @@ async def ask_question(req: QueryRequest):
                 bm25_norm = float(bm25_score_map.get(idx_int, 0.0)) / max_bm25 if max_bm25 > 0 else 0.5
                 score_val = 0.52 + (bm25_norm * 0.33)
 
-            chunk_identifier = str(cand.get("chunk_id") or f"{cand.get('query_id', idx_int)}#0")
-            passage_identifier = str(cand.get("query_id") or cand.get("passage_id") or idx_int)
+            cid = corpus_chunk_ids[idx_int]
+            hq = corpus_queries[idx_int]
+            ha = corpus_answers[idx_int]
 
             retrieved_docs.append({
-                "chunk_id": chunk_identifier,
-                "passage_id": passage_identifier,
-                "query_id": passage_identifier,
+                "chunk_id": str(cid),
+                "passage_id": str(cid.split('#')[0] if '#' in str(cid) else cid),
+                "query_id": str(cid.split('#')[0] if '#' in str(cid) else cid),
                 "strategy": "metadata_aware",
                 "score": round(score_val, 3),
-                "query": cand.get("hindi_query", ""),
-                "matched_question": cand.get("hindi_query", ""),
-                "answer": cand.get("hindi_answer", ""),
-                "chunk_text": cand.get("chunk_text") or cand.get("hindi_passage") or cand.get("hindi_answer", ""),
+                "query": hq,
+                "matched_question": hq,
+                "answer": ha,
+                "chunk_text": ha,
             })
         retrieved_docs = retrieved_docs[:max(req.k, 4)]
+
 
         retrieval_latency = (time.perf_counter() - t0_rag) * 1000
 
