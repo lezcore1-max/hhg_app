@@ -162,8 +162,14 @@ def get_query_embedding(query_text: str):
             input_ids = np.array([enc.ids], dtype=np.int64)
             attention_mask = np.array([enc.attention_mask], dtype=np.int64)
             
-            outputs = onnx_session.run(None, {"input_ids": input_ids, "attention_mask": attention_mask})
+            input_names = [inp.name for inp in onnx_session.get_inputs()]
+            feed = {"input_ids": input_ids, "attention_mask": attention_mask}
+            if "token_type_ids" in input_names:
+                feed["token_type_ids"] = np.zeros_like(input_ids)
+            
+            outputs = onnx_session.run(None, feed)
             token_embeddings = outputs[0]  # [1, seq_len, 384]
+
             
             # Mean-pool over attention mask
             mask_exp = np.expand_dims(attention_mask, -1).astype(float)
