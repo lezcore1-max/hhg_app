@@ -56,6 +56,15 @@ def _download_file_with_progress(url: str, dest_path: str, fname: str):
 
 def _ensure_data_files():
     """Download FAISS index and Parquet from HuggingFace Hub with live MB logs."""
+    # Clean up old large files from previous model to free disk space
+    old_files = ["hindi_passages.faiss"]
+    for old_f in old_files:
+        old_path = os.path.join(DATA_DIR, old_f)
+        if os.path.exists(old_path):
+            print(f"🧹 Removing old file {old_f} to free disk space...", flush=True)
+            os.remove(old_path)
+            print(f"   ✅ Removed {old_f}", flush=True)
+
     files_needed = ["small_hindi_passages.faiss", "chunks_for_embedding.parquet"]
     missing = [f for f in files_needed if not os.path.exists(os.path.join(DATA_DIR, f))]
     if not missing:
