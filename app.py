@@ -57,7 +57,7 @@ def _download_file_with_progress(url: str, dest_path: str, fname: str):
 def _ensure_data_files():
     """Download FAISS index and Parquet from HuggingFace Hub with live MB logs."""
     model_dir = os.path.join(DATA_DIR, "onnx")
-    if not os.path.exists(os.path.join(model_dir, "model.onnx")):
+    if not os.path.exists(os.path.join(model_dir, "onnx", "model.onnx")):
         print("⬇️ Downloading ONNX model for embeddings...", flush=True)
         from huggingface_hub import snapshot_download
         snapshot_download(repo_id="intfloat/multilingual-e5-small", 
@@ -144,7 +144,7 @@ def get_query_embedding(query_text: str):
         from tokenizers import Tokenizer
         model_dir = os.path.join(DATA_DIR, "onnx")
         _tokenizer = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
-        _onnx_session = ort.InferenceSession(os.path.join(model_dir, "model.onnx"), providers=['CPUExecutionProvider'])
+        _onnx_session = ort.InferenceSession(os.path.join(model_dir, "onnx", "model.onnx"), providers=['CPUExecutionProvider'])
         
     try:
         # Prepend query: as required by E5
