@@ -302,7 +302,7 @@ def health_check():
         return {
             "status": "ready",
             "engine": "Hindi RAG QA Engine v2.2",
-            "records_indexed": len(df_queries) if df_queries is not None else 0,
+            "records_indexed": total_records,
             "models": {
                 "embedding": EMBED_MODEL_NAME,
                 "dimension": VECTOR_DIM,
@@ -325,7 +325,7 @@ async def ask_question(req: QueryRequest):
         msg = f"Engine loading error: {_engine_error}" if _engine_error else "RAG engine is still loading, please retry in a moment."
         raise HTTPException(status_code=503, detail=msg)
 
-    if (mmap_vectors is None and index_q is None) or df_queries is None:
+    if (mmap_vectors is None and index_q is None) or corpus_queries is None:
         raise HTTPException(status_code=503, detail="RAG Engine not initialized.")
 
     t0_rag = time.perf_counter()
@@ -347,7 +347,7 @@ async def ask_question(req: QueryRequest):
                     dense_idx = part_idx[np.argsort(scores[part_idx])[::-1]]
                     dense_scores = scores[dense_idx]
                     for d_i, d_sc in zip(dense_idx, dense_scores):
-                        if 0 <= d_i < len(df_queries):
+                        if 0 <= d_i < total_records:
                             dense_score_map[int(d_i)] = float(d_sc)
                 elif index_q is not None:
                     q_emb_arr = np.array([q_emb], dtype="float32")
@@ -355,7 +355,7 @@ async def ask_question(req: QueryRequest):
                     dense_idx = dense_idx_arr[0]
                     dense_scores = dense_scores_arr[0]
                     for d_i, d_sc in zip(dense_idx, dense_scores):
-                        if 0 <= d_i < len(df_queries):
+                        if 0 <= d_i < total_records:
                             dense_score_map[int(d_i)] = float(d_sc)
         except Exception as embed_err:
             print(f"⚠️ Dense search error: {embed_err}", flush=True)
@@ -376,7 +376,7 @@ async def ask_question(req: QueryRequest):
         rrf_scores = {}
         for rank, d_id in enumerate(dense_idx):
             d_id_int = int(d_id)
-            if 0 <= d_id_int < len(df_queries):
+            if 0 <= d_id_int < total_records:
                 rrf_scores[d_id_int] = rrf_scores.get(d_id_int, 0.0) + (1.0 / (k_rrf + rank + 1))
 
         bm25_sorted_cand = sorted(bm25_score_map.keys(), key=lambda x: bm25_score_map[x], reverse=True)
