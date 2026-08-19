@@ -33,20 +33,22 @@ def _ensure_data_files():
     files_needed = ["hindi_passages.faiss", "chunks_for_embedding.parquet"]
     missing = [f for f in files_needed if not os.path.exists(f)]
     if not missing:
+        print("✅ All required data files already exist locally on disk.", flush=True)
         return
-    print(f"⬇️  Data files missing: {missing}. Downloading from HuggingFace Hub ({HF_DATASET_REPO})...")
+    print(f"⬇️  Data files missing: {missing}. Downloading from HuggingFace Hub ({HF_DATASET_REPO})...", flush=True)
     try:
         from huggingface_hub import hf_hub_download
         for fname in missing:
-            print(f"   Downloading {fname}...")
+            print(f"   ⏳ Downloading {fname} from HuggingFace Hub... (Please wait, downloading 1.4GB dataset)", flush=True)
             hf_hub_download(
                 repo_id=HF_DATASET_REPO,
                 filename=fname,
                 repo_type="dataset",
                 local_dir="."
             )
-            print(f"   ✅ {fname} ready.")
+            print(f"   ✅ {fname} download complete!", flush=True)
     except Exception as e:
+        print(f"❌ Failed to download data files: {e}", flush=True)
         raise RuntimeError(
             f"Failed to download data files from HuggingFace Hub '{HF_DATASET_REPO}': {e}\n"
             "Place hindi_passages.faiss, chunks_for_embedding.parquet in the working directory "
@@ -61,12 +63,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if GEMINI_API_KEY:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
-    print("⚠️ WARNING: GEMINI_API_KEY not found in environment variables or .env file!")
+    print("⚠️ WARNING: GEMINI_API_KEY not found in environment variables or .env file!", flush=True)
     gemini_client = None
 
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 if not SARVAM_API_KEY:
-    print("⚠️ WARNING: SARVAM_API_KEY not found — /voice-ask and /ws/sarvam will fail until it is set.")
+    print("⚠️ WARNING: SARVAM_API_KEY not found — /voice-ask and /ws/sarvam will fail until it is set.", flush=True)
 
 # Comma-separated list of allowed origins, e.g. "https://myapp.com,https://www.myapp.com"
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
@@ -123,40 +125,41 @@ def get_query_embedding(query_text: str):
         norm = np.linalg.norm(arr)
         return (arr / norm) if norm > 0 else arr
     except Exception as e:
-        print(f"⚠️ get_query_embedding HF API error: {e}")
+        print(f"⚠️ get_query_embedding HF API error: {e}", flush=True)
         return None
 
 
 @app.on_event("startup")
 def startup_event():
     global df, index_q, bm25
-    print("=" * 60)
-    print("🚀 INITIALIZING HINDI RAG ENGINE (NATIVE FAISS + PARQUET)...")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print("🚀 INITIALIZING HINDI RAG ENGINE (NATIVE FAISS + PARQUET)...", flush=True)
+    print("=" * 60, flush=True)
 
     # 0. Auto-download data files from HuggingFace Hub if needed
     _ensure_data_files()
 
     # 1. Load Parquet Data
-    print(f"📦 Loading dataset from {PARQUET_PATH}...")
+    print(f"📦 Step 1/3: Loading parquet dataset from {PARQUET_PATH}...", flush=True)
     df = pd.read_parquet(PARQUET_PATH)
-    print(f"   Loaded {len(df):,} chunk records.")
+    print(f"   ✅ Loaded {len(df):,} chunk records into RAM!", flush=True)
 
     # 2. Load Native FAISS Index
-    print("⚡ Loading native FAISS index...")
+    print(f"⚡ Step 2/3: Loading native FAISS index from {INDEX_Q_PATH}...", flush=True)
     index_q = faiss.read_index(INDEX_Q_PATH)
+    print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
     if index_q.ntotal != len(df):
         print(f"⚠️ WARNING: FAISS index has {index_q.ntotal:,} vectors but parquet has "
-              f"{len(df):,} rows — these should match. Retrieval indices will be misaligned!")
+              f"{len(df):,} rows — these should match.", flush=True)
 
     # 3. Build BM25 Index (over hindi_query)
-    print("🔍 Building BM25 keyword index...")
+    print("🔍 Step 3/3: Building BM25 keyword index...", flush=True)
     tokenized_queries = [str(q).split() for q in df["hindi_query"].tolist()]
     bm25 = BM25Okapi(tokenized_queries)
 
-    print("=" * 60)
-    print(f"✅ HINDI RAG ENGINE READY — {len(df):,} chunks indexed ({EMBED_MODEL_NAME})")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print(f"✅ HINDI RAG ENGINE READY — {len(df):,} chunks indexed ({EMBED_MODEL_NAME})", flush=True)
+    print("=" * 60, flush=True)
 
 
 class QueryRequest(BaseModel):
