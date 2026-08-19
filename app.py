@@ -42,6 +42,15 @@ PARQUET_PATH = os.path.join(DATA_DIR, "chunks_for_embedding.parquet")
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"  # 384-dim lightweight embedding model
 VECTOR_DIM = 384  # multilingual-e5-small output dimension
 
+# Devanagari script-aware tokenization regex (preserves Devanagari matras and viramas)
+import re
+HINDI_TOKEN_REGEX = re.compile(r'[^\s\.,;!?।॥\(\)\[\]\{\}"\':]+')
+
+def tokenize_hindi(text: str) -> list[str]:
+    """Preserves full Devanagari words without shattering vowels or viramas."""
+    return HINDI_TOKEN_REGEX.findall(str(text).lower())
+
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if GEMINI_API_KEY:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -220,10 +229,11 @@ def _load_rag_engine_background():
             index_q = faiss.read_index(INDEX_Q_PATH)
             print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
 
-        # 3. Build BM25 Index over hindi_query
-        print("🔍 Step 3/3: Building BM25 keyword index...", flush=True)
-        tokenized_queries = [str(q).split() for q in df_queries["hindi_query"].tolist()]
+        # 3. Build BM25 Index with script-aware Devanagari tokenization
+        print("🔍 Step 3/3: Building Devanagari script-aware BM25 keyword index...", flush=True)
+        tokenized_queries = [tokenize_hindi(q) for q in df_queries["hindi_query"].tolist()]
         bm25 = BM25Okapi(tokenized_queries)
+
 
         # 4. Pre-load and pre-warm local embedding model
         print(f"🧠 Loading and pre-warming {EMBED_MODEL_NAME} embedding model...", flush=True)
@@ -358,13 +368,15 @@ async def ask_question(req: QueryRequest):
             print(f"⚠️ Dense search error: {embed_err}", flush=True)
 
 
-        # 2. Fast Candidate BM25 Scoring
+        # 2. Fast Candidate BM25 Scoring with Devanagari Tokenizer
         cand_doc_ids = list(dense_score_map.keys())
         bm25_score_map = {}
         if cand_doc_ids:
-            bm25_batch = bm25.get_batch_scores(query_text.split(), cand_doc_ids)
+            q_tokens = tokenize_hindi(query_text)
+            bm25_batch = bm25.get_batch_scores(q_tokens, cand_doc_ids)
             for d_id, b_sc in zip(cand_doc_ids, bm25_batch):
                 bm25_score_map[d_id] = float(b_sc)
+
 
         # 3. Reciprocal Rank Fusion (RRF) over Candidate Pool
         k_rrf = 60
