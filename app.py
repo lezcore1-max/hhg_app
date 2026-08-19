@@ -173,41 +173,63 @@ def fetch_candidate_rows_on_demand(top_indices: list):
         return {}
 
 
+import threading
+
+# Track engine readiness (set to True once all data is loaded)
+_engine_ready = False
+_engine_error = None
+
+
+def _load_rag_engine_background():
+    """Run all heavy data loading in a background thread so FastAPI starts instantly."""
+    global df_queries, parquet_dataset, mmap_vectors, index_q, bm25, _engine_ready, _engine_error
+    try:
+        print("=" * 60, flush=True)
+        print("🚀 INITIALIZING HINDI RAG ENGINE (BACKGROUND THREAD)...", flush=True)
+        print("=" * 60, flush=True)
+
+        # 0. Auto-download data files from HuggingFace Hub if needed
+        _ensure_data_files()
+
+        # 1. Load Parquet Dataset Handle & 1 Lightweight Column
+        print(f"📦 Step 1/3: Loading 1-column query index from {PARQUET_PATH}...", flush=True)
+        parquet_dataset = ds.dataset(PARQUET_PATH, format="parquet")
+        df_queries = pd.read_parquet(PARQUET_PATH, columns=["hindi_query"])
+        total_records = len(df_queries)
+        print(f"   ✅ Loaded {total_records:,} query strings into RAM (~55 MB RAM total)!", flush=True)
+
+        # 2. Memory-Map Vector Matrix (0 MB RAM overhead!)
+        print(f"⚡ Step 2/3: Memory-mapping 2.08GB vector matrix from {INDEX_Q_PATH}...", flush=True)
+        try:
+            mmap_vectors = np.memmap(INDEX_Q_PATH, dtype="float32", mode="r", offset=45, shape=(total_records, 1024))
+            print(f"   ✅ Vector matrix memory-mapped ({total_records:,} vectors, 0 MB RAM)!", flush=True)
+        except Exception as mmap_err:
+            print(f"⚠️ Vector mmap fallback ({mmap_err}); loading FAISS index...", flush=True)
+            index_q = faiss.read_index(INDEX_Q_PATH)
+            print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
+
+        # 3. Build BM25 Index
+        print("🔍 Step 3/3: Building BM25 keyword index...", flush=True)
+        tokenized_queries = [str(q).split() for q in df_queries["hindi_query"].tolist()]
+        bm25 = BM25Okapi(tokenized_queries)
+
+        _engine_ready = True
+        print("=" * 60, flush=True)
+        print(f"🎯 HHG RAG ENGINE READY — {total_records:,} chunks indexed!", flush=True)
+        print("=" * 60, flush=True)
+
+    except Exception as e:
+        _engine_error = str(e)
+        print(f"🚨 ENGINE LOAD FAILED: {e}", flush=True)
+
+
 @app.on_event("startup")
 def startup_event():
-    global df_queries, parquet_dataset, mmap_vectors, index_q, bm25
-    print("=" * 60, flush=True)
-    print("🚀 INITIALIZING HINDI RAG ENGINE (0-RAM MEMORY-MAPPED VECTORS + PARQUET)...", flush=True)
-    print("=" * 60, flush=True)
+    """Start FastAPI immediately, load data in background thread."""
+    print("🟢 FastAPI started — launching RAG engine loader in background thread...", flush=True)
+    t = threading.Thread(target=_load_rag_engine_background, daemon=True)
+    t.start()
 
-    # 0. Auto-download data files from HuggingFace Hub if needed
-    _ensure_data_files()
-
-    # 1. Load Parquet Dataset Handle & 1 Lightweight Column (saves 800MB RAM!)
-    print(f"📦 Step 1/3: Loading 1-column query index from {PARQUET_PATH}...", flush=True)
-    parquet_dataset = ds.dataset(PARQUET_PATH, format="parquet")
-    df_queries = pd.read_parquet(PARQUET_PATH, columns=["hindi_query"])
-    total_records = len(df_queries)
-    print(f"   ✅ Loaded {total_records:,} query strings into RAM (~55 MB RAM total)!", flush=True)
-
-    # 2. Memory-Map Vector Matrix (0 MB RAM overhead!)
-    print(f"⚡ Step 2/3: Memory-mapping 2.08GB vector matrix from {INDEX_Q_PATH}...", flush=True)
-    try:
-        mmap_vectors = np.memmap(INDEX_Q_PATH, dtype="float32", mode="r", offset=45, shape=(total_records, 1024))
-        print(f"   ✅ Vector matrix memory-mapped successfully ({total_records:,} vectors, 0 MB RAM overhead)!", flush=True)
-    except Exception as mmap_err:
-        print(f"⚠️ Vector mmap fallback ({mmap_err}); loading FAISS index...", flush=True)
-        index_q = faiss.read_index(INDEX_Q_PATH)
-        print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
-
-    # 3. Build BM25 Index (over hindi_query)
-    print("🔍 Step 3/3: Building BM25 keyword index...", flush=True)
-    tokenized_queries = [str(q).split() for q in df_queries["hindi_query"].tolist()]
-    bm25 = BM25Okapi(tokenized_queries)
-
-    print("=" * 60, flush=True)
-    print(f"✅ HINDI RAG ENGINE READY — {total_records:,} chunks indexed ({EMBED_MODEL_NAME})", flush=True)
-    print("=" * 60, flush=True)
 
 
 class QueryRequest(BaseModel):
@@ -252,16 +274,19 @@ def guardrail_check(top_results: list, query_embedding: np.ndarray | None,
 
 
 @app.get("/")
+@app.get("/health")
 def health_check():
-    return {
-        "status": "online",
-        "engine": "Hindi RAG QA Engine v2.1",
-        "records_indexed": len(df_queries) if df_queries is not None else 0,
-        "models": {
-            "embedding": f"local sentence-transformers ({EMBED_MODEL_NAME})",
-            "llm": "gemini-3.1-flash-lite"
+    """Always returns 200 OK immediately — Railway healthcheck safe."""
+    if _engine_ready:
+        return {
+            "status": "ready",
+            "engine": "Hindi RAG QA Engine v2.1",
+            "records_indexed": len(df_queries) if df_queries is not None else 0,
         }
-    }
+    elif _engine_error:
+        return {"status": "error", "detail": _engine_error}
+    else:
+        return {"status": "loading", "message": "RAG engine is initializing in background, please wait..."}
 
 
 @app.post("/ask")
@@ -270,8 +295,13 @@ async def ask_question(req: QueryRequest):
     if not query_text:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
+    if not _engine_ready:
+        msg = f"Engine loading: {_engine_error}" if _engine_error else "RAG engine is still loading, please retry in a moment."
+        raise HTTPException(status_code=503, detail=msg)
+
     if (mmap_vectors is None and index_q is None) or df_queries is None:
-        raise HTTPException(status_code=500, detail="RAG Engine not initialized.")
+        raise HTTPException(status_code=503, detail="RAG Engine not initialized.")
+
 
     t0_rag = time.perf_counter()
 
