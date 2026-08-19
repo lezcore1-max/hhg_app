@@ -22,6 +22,13 @@ if sys.platform.startswith("win"):
 # ── Load environment variables ──────────────────────────────────────────────
 load_dotenv()
 
+try:
+    import torch
+    torch.set_num_threads(4)
+except Exception:
+    pass
+
+
 from google import genai
 from google.genai import types
 import websockets
