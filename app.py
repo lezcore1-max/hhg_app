@@ -56,7 +56,7 @@ def _download_file_with_progress(url: str, dest_path: str, fname: str):
 
 def _ensure_data_files():
     """Download FAISS index and Parquet from HuggingFace Hub with live MB logs."""
-    files_needed = ["hindi_passages.faiss", "chunks_for_embedding.parquet"]
+    files_needed = ["small_hindi_passages.faiss", "chunks_for_embedding.parquet"]
     missing = [f for f in files_needed if not os.path.exists(os.path.join(DATA_DIR, f))]
     if not missing:
         print(f"✅ All required data files already exist in {DATA_DIR}. Skipping download.", flush=True)
@@ -117,14 +117,15 @@ mmap_vectors = None
 index_q = None
 bm25 = None
 
-INDEX_Q_PATH = os.path.join(DATA_DIR, "hindi_passages.faiss")
+INDEX_Q_PATH = os.path.join(DATA_DIR, "small_hindi_passages.faiss")
 PARQUET_PATH = os.path.join(DATA_DIR, "chunks_for_embedding.parquet")
-EMBED_MODEL_NAME = "BAAI/bge-m3"
+EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"  # 384-dim, lightweight
+VECTOR_DIM = 384  # multilingual-e5-small output dimension
 
 
 
 def get_query_embedding(query_text: str):
-    """Lightweight query embedding via HF Inference API (BAAI/bge-m3)."""
+    """Lightweight query embedding via HF Inference API (intfloat/multilingual-e5-small, 384-dim)."""
     hf_token = os.environ.get("HF_TOKEN", "")
     try:
         from huggingface_hub import InferenceClient
@@ -186,10 +187,10 @@ def _load_rag_engine_background():
         print(f"   ✅ Loaded {total_records:,} query strings into RAM (~55 MB RAM total)!", flush=True)
 
         # 2. Memory-Map Vector Matrix (0 MB RAM overhead!)
-        print(f"⚡ Step 2/3: Memory-mapping 2.08GB vector matrix from {INDEX_Q_PATH}...", flush=True)
+        print(f"⚡ Step 2/3: Memory-mapping vector matrix from {INDEX_Q_PATH} (dim={VECTOR_DIM})...", flush=True)
         try:
-            mmap_vectors = np.memmap(INDEX_Q_PATH, dtype="float32", mode="r", offset=45, shape=(total_records, 1024))
-            print(f"   ✅ Vector matrix memory-mapped ({total_records:,} vectors, 0 MB RAM)!", flush=True)
+            mmap_vectors = np.memmap(INDEX_Q_PATH, dtype="float32", mode="r", offset=45, shape=(total_records, VECTOR_DIM))
+            print(f"   ✅ Vector matrix memory-mapped ({total_records:,} vectors × {VECTOR_DIM}-dim, 0 MB RAM)!", flush=True)
         except Exception as mmap_err:
             print(f"⚠️ Vector mmap fallback ({mmap_err}); loading FAISS index...", flush=True)
             index_q = faiss.read_index(INDEX_Q_PATH)
