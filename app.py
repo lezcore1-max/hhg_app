@@ -28,32 +28,48 @@ from sentence_transformers import SentenceTransformer
 HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "lezcore1-max/tilt-rag-data")
 
 
+def _download_file_with_progress(url: str, dest_path: str, fname: str):
+    """Download a file via HTTP with live MB progress logging for cloud containers."""
+    import requests
+    response = requests.get(url, stream=True, timeout=60)
+    response.raise_for_status()
+    total_size = int(response.headers.get('content-length', 0))
+    total_mb = total_size / (1024 * 1024)
+    
+    downloaded = 0
+    last_log_mb = 0
+    with open(dest_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+                current_mb = downloaded / (1024 * 1024)
+                if current_mb - last_log_mb >= 50 or downloaded == total_size:
+                    pct = (downloaded / total_size * 100) if total_size > 0 else 0
+                    print(f"   ⬇️ {fname}: {current_mb:.1f} MB / {total_mb:.1f} MB ({pct:.1f}%)", flush=True)
+                    last_log_mb = current_mb
+
+
 def _ensure_data_files():
-    """Download FAISS index and Parquet from HuggingFace Hub if not present locally."""
+    """Download FAISS index and Parquet from HuggingFace Hub with live MB logs."""
     files_needed = ["hindi_passages.faiss", "chunks_for_embedding.parquet"]
     missing = [f for f in files_needed if not os.path.exists(f)]
     if not missing:
         print("✅ All required data files already exist locally on disk.", flush=True)
         return
-    print(f"⬇️  Data files missing: {missing}. Downloading from HuggingFace Hub ({HF_DATASET_REPO})...", flush=True)
-    try:
-        from huggingface_hub import hf_hub_download
-        for fname in missing:
-            print(f"   ⏳ Downloading {fname} from HuggingFace Hub... (Please wait, downloading 1.4GB dataset)", flush=True)
-            hf_hub_download(
-                repo_id=HF_DATASET_REPO,
-                filename=fname,
-                repo_type="dataset",
-                local_dir="."
-            )
-            print(f"   ✅ {fname} download complete!", flush=True)
-    except Exception as e:
-        print(f"❌ Failed to download data files: {e}", flush=True)
-        raise RuntimeError(
-            f"Failed to download data files from HuggingFace Hub '{HF_DATASET_REPO}': {e}\n"
-            "Place hindi_passages.faiss, chunks_for_embedding.parquet in the working directory "
-            "or set HF_DATASET_REPO env variable."
-        )
+        
+    print(f"⬇️ Data files missing: {missing}. Downloading from HuggingFace Hub ({HF_DATASET_REPO})...", flush=True)
+    for fname in missing:
+        url = f"https://huggingface.co/datasets/{HF_DATASET_REPO}/resolve/main/{fname}"
+        print(f"   ⏳ Starting download for {fname}...", flush=True)
+        try:
+            _download_file_with_progress(url, fname, fname)
+            print(f"   ✅ {fname} ready!", flush=True)
+        except Exception as e:
+            print(f"⚠️ Direct download failed for {fname} ({e}), trying fallback hf_hub_download...", flush=True)
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(repo_id=HF_DATASET_REPO, filename=fname, repo_type="dataset", local_dir=".")
+            print(f"   ✅ {fname} ready via fallback!", flush=True)
 
 
 # ── Load environment variables ──────────────────────────────────────────────
