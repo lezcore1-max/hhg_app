@@ -192,7 +192,7 @@ def get_query_embedding(query_text: str):
 # ── Background Engine Initialization ─────────────────────────────────────────
 def _load_rag_engine_background():
     """Run all heavy data loading in a background thread so FastAPI starts instantly."""
-    global corpus_chunk_ids, corpus_queries, corpus_answers, total_records, mmap_vectors, index_q, bm25, embed_model, _engine_ready, _engine_error
+    global corpus_chunk_ids, corpus_queries, corpus_answers, total_records, mmap_vectors, index_q, bm25, embed_model, onnx_session, onnx_tokenizer, _engine_ready, _engine_error
     try:
         print("=" * 60, flush=True)
         print("🚀 INITIALIZING HINDI RAG ENGINE (BACKGROUND THREAD)...", flush=True)
@@ -231,22 +231,35 @@ def _load_rag_engine_background():
         try:
             import onnxruntime as ort
             from tokenizers import Tokenizer
-            
-            onnx_model_path = hf_hub_download(EMBED_MODEL_NAME, "onnx/model.onnx", local_dir=DATA_DIR)
-            onnx_tok_path = hf_hub_download(EMBED_MODEL_NAME, "tokenizer.json", local_dir=DATA_DIR)
-            
+
+            # Try local paths first (already downloaded), then HF download
+            _local_onnx = os.path.join(DATA_DIR, "onnx", "model.onnx")
+            _local_tok  = os.path.join(DATA_DIR, "tokenizer.json")
+
+            if os.path.exists(_local_onnx) and os.path.exists(_local_tok):
+                onnx_model_path = _local_onnx
+                onnx_tok_path   = _local_tok
+                print(f"   Using cached ONNX files from {DATA_DIR}", flush=True)
+            else:
+                print("   Downloading ONNX model from HuggingFace Hub...", flush=True)
+                onnx_model_path = hf_hub_download(EMBED_MODEL_NAME, "onnx/model.onnx", local_dir=DATA_DIR)
+                onnx_tok_path   = hf_hub_download(EMBED_MODEL_NAME, "tokenizer.json",  local_dir=DATA_DIR)
+
             onnx_tokenizer = Tokenizer.from_file(onnx_tok_path)
             onnx_tokenizer.enable_truncation(max_length=512)
-            
+
             sess_opts = ort.SessionOptions()
             sess_opts.intra_op_num_threads = 4
             onnx_session = ort.InferenceSession(onnx_model_path, sess_opts, providers=["CPUExecutionProvider"])
-            
-            # Warm up
-            _ = get_query_embedding("warm up")
-            print(f"   ✅ ONNX {EMBED_MODEL_NAME} loaded and warmed up (~9ms CPU latency, 0 PyTorch RAM)!", flush=True)
+
+            # Warm up and verify
+            test_emb = get_query_embedding("warm up test")
+            if test_emb is None:
+                raise RuntimeError("ONNX warm-up returned None — session may be broken")
+            print(f"   ✅ ONNX ready! Query embedding: {test_emb.shape}, norm={float(np.linalg.norm(test_emb)):.4f}", flush=True)
         except Exception as onnx_err:
-            print(f"   ⚠️ ONNX load note: {onnx_err}", flush=True)
+            print(f"   🚨 ONNX load FAILED: {onnx_err}", flush=True)
+            import traceback; traceback.print_exc()
 
 
         _engine_ready = True
