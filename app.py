@@ -23,7 +23,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from rank_bm25 import BM25Okapi
 import faiss
-from sentence_transformers import SentenceTransformer
 
 HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "lezcore1-max/tilt-rag-data")
 
@@ -117,7 +116,6 @@ parquet_dataset = None
 mmap_vectors = None
 index_q = None
 bm25 = None
-embed_model = None
 
 INDEX_Q_PATH = os.path.join(DATA_DIR, "hindi_passages.faiss")
 PARQUET_PATH = os.path.join(DATA_DIR, "chunks_for_embedding.parquet")
@@ -126,18 +124,7 @@ EMBED_MODEL_NAME = "BAAI/bge-m3"
 
 
 def get_query_embedding(query_text: str):
-    """
-    Fast, lightweight query embedding via HF Inference API (or local sentence-transformers fallback).
-    Prevents downloading 2.2GB PyTorch model weights on Railway cloud containers.
-    """
-    global embed_model
-    if embed_model is not None:
-        try:
-            emb = embed_model.encode(f"query: {query_text}", normalize_embeddings=True)
-            return np.asarray(emb, dtype="float32")
-        except Exception:
-            pass
-
+    """Lightweight query embedding via HF Inference API (BAAI/bge-m3)."""
     hf_token = os.environ.get("HF_TOKEN", "")
     try:
         from huggingface_hub import InferenceClient
