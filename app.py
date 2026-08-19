@@ -27,6 +27,11 @@ from sentence_transformers import SentenceTransformer
 
 HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "lezcore1-max/tilt-rag-data")
 
+# Persistent data directory — use Railway Volume (/app/data) if available, else current dir
+DATA_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.isdir("/app/data") else ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+print(f"[INIT] Using data directory: {DATA_DIR}", flush=True)
+
 
 def _download_file_with_progress(url: str, dest_path: str, fname: str):
     """Download a file via HTTP with live MB progress logging for cloud containers."""
@@ -53,23 +58,25 @@ def _download_file_with_progress(url: str, dest_path: str, fname: str):
 def _ensure_data_files():
     """Download FAISS index and Parquet from HuggingFace Hub with live MB logs."""
     files_needed = ["hindi_passages.faiss", "chunks_for_embedding.parquet"]
-    missing = [f for f in files_needed if not os.path.exists(f)]
+    missing = [f for f in files_needed if not os.path.exists(os.path.join(DATA_DIR, f))]
     if not missing:
-        print("✅ All required data files already exist locally on disk.", flush=True)
+        print(f"✅ All required data files already exist in {DATA_DIR}. Skipping download.", flush=True)
         return
         
     print(f"⬇️ Data files missing: {missing}. Downloading from HuggingFace Hub ({HF_DATASET_REPO})...", flush=True)
     for fname in missing:
         url = f"https://huggingface.co/datasets/{HF_DATASET_REPO}/resolve/main/{fname}"
-        print(f"   ⏳ Starting download for {fname}...", flush=True)
+        dest_path = os.path.join(DATA_DIR, fname)
+        print(f"   ⏳ Starting download for {fname} -> {dest_path}...", flush=True)
         try:
-            _download_file_with_progress(url, fname, fname)
+            _download_file_with_progress(url, dest_path, fname)
             print(f"   ✅ {fname} ready!", flush=True)
         except Exception as e:
             print(f"⚠️ Direct download failed for {fname} ({e}), trying fallback hf_hub_download...", flush=True)
             from huggingface_hub import hf_hub_download
-            hf_hub_download(repo_id=HF_DATASET_REPO, filename=fname, repo_type="dataset", local_dir=".")
+            hf_hub_download(repo_id=HF_DATASET_REPO, filename=fname, repo_type="dataset", local_dir=DATA_DIR)
             print(f"   ✅ {fname} ready via fallback!", flush=True)
+
 
 
 # ── Load environment variables ──────────────────────────────────────────────
@@ -112,9 +119,10 @@ index_q = None
 bm25 = None
 embed_model = None
 
-INDEX_Q_PATH = "hindi_passages.faiss"
-PARQUET_PATH = "chunks_for_embedding.parquet"
+INDEX_Q_PATH = os.path.join(DATA_DIR, "hindi_passages.faiss")
+PARQUET_PATH = os.path.join(DATA_DIR, "chunks_for_embedding.parquet")
 EMBED_MODEL_NAME = "BAAI/bge-m3"
+
 
 
 def get_query_embedding(query_text: str):
