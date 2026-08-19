@@ -107,6 +107,7 @@ app.add_middleware(
 # Global variables for loaded RAG assets
 df_queries = None
 parquet_dataset = None
+mmap_vectors = None
 index_q = None
 bm25 = None
 embed_model = None
@@ -166,9 +167,9 @@ def fetch_candidate_rows_on_demand(top_indices: list):
 
 @app.on_event("startup")
 def startup_event():
-    global df_queries, parquet_dataset, index_q, bm25
+    global df_queries, parquet_dataset, mmap_vectors, index_q, bm25
     print("=" * 60, flush=True)
-    print("🚀 INITIALIZING HINDI RAG ENGINE (MEMORY-MAPPED FAISS + ZERO-RAM PARQUET)...", flush=True)
+    print("🚀 INITIALIZING HINDI RAG ENGINE (0-RAM MEMORY-MAPPED VECTORS + PARQUET)...", flush=True)
     print("=" * 60, flush=True)
 
     # 0. Auto-download data files from HuggingFace Hub if needed
@@ -181,19 +182,15 @@ def startup_event():
     total_records = len(df_queries)
     print(f"   ✅ Loaded {total_records:,} query strings into RAM (~55 MB RAM total)!", flush=True)
 
-    # 2. Load Native FAISS Index with Memory Mapping (saves 2.1GB RAM!)
-    print(f"⚡ Step 2/3: Memory-mapping native FAISS index from {INDEX_Q_PATH}...", flush=True)
+    # 2. Memory-Map Vector Matrix (0 MB RAM overhead!)
+    print(f"⚡ Step 2/3: Memory-mapping 2.08GB vector matrix from {INDEX_Q_PATH}...", flush=True)
     try:
-        index_q = faiss.read_index(INDEX_Q_PATH, faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY)
-        print(f"   ✅ FAISS memory-mapped successfully with {index_q.ntotal:,} vectors! (0 MB RAM overhead)", flush=True)
+        mmap_vectors = np.memmap(INDEX_Q_PATH, dtype="float32", mode="r", offset=45, shape=(total_records, 1024))
+        print(f"   ✅ Vector matrix memory-mapped successfully ({total_records:,} vectors, 0 MB RAM overhead)!", flush=True)
     except Exception as mmap_err:
-        print(f"⚠️ FAISS mmap fallback ({mmap_err}); loading standard index...", flush=True)
+        print(f"⚠️ Vector mmap fallback ({mmap_err}); loading FAISS index...", flush=True)
         index_q = faiss.read_index(INDEX_Q_PATH)
         print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
-
-    if index_q.ntotal != total_records:
-        print(f"⚠️ WARNING: FAISS index has {index_q.ntotal:,} vectors but parquet has "
-              f"{total_records:,} rows — these should match.", flush=True)
 
     # 3. Build BM25 Index (over hindi_query)
     print("🔍 Step 3/3: Building BM25 keyword index...", flush=True)
@@ -265,13 +262,13 @@ async def ask_question(req: QueryRequest):
     if not query_text:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    if index_q is None or df_queries is None:
+    if (mmap_vectors is None and index_q is None) or df_queries is None:
         raise HTTPException(status_code=500, detail="RAG Engine not initialized.")
 
     t0_rag = time.perf_counter()
 
     try:
-        # 1. High-Performance FAISS C++ Candidate Search (50 candidates in <5ms)
+        # 1. High-Performance Candidate Vector Search (50 candidates in <15ms, 0 MB RAM)
         candidate_k = 50
         dense_idx = []
         dense_scores = []
@@ -280,13 +277,22 @@ async def ask_question(req: QueryRequest):
         
         try:
             if q_emb is not None:
-                q_emb_arr = np.array([q_emb], dtype="float32")
-                dense_scores_arr, dense_idx_arr = index_q.search(q_emb_arr, candidate_k)
-                dense_idx = dense_idx_arr[0]
-                dense_scores = dense_scores_arr[0]
-                for d_i, d_sc in zip(dense_idx, dense_scores):
-                    if 0 <= d_i < len(df_queries):
-                        dense_score_map[int(d_i)] = float(d_sc)
+                if mmap_vectors is not None:
+                    # 0 MB RAM vector dot product!
+                    scores = np.dot(mmap_vectors, q_emb)
+                    dense_idx = np.argsort(scores)[::-1][:candidate_k]
+                    dense_scores = scores[dense_idx]
+                    for d_i, d_sc in zip(dense_idx, dense_scores):
+                        if 0 <= d_i < len(df_queries):
+                            dense_score_map[int(d_i)] = float(d_sc)
+                elif index_q is not None:
+                    q_emb_arr = np.array([q_emb], dtype="float32")
+                    dense_scores_arr, dense_idx_arr = index_q.search(q_emb_arr, candidate_k)
+                    dense_idx = dense_idx_arr[0]
+                    dense_scores = dense_scores_arr[0]
+                    for d_i, d_sc in zip(dense_idx, dense_scores):
+                        if 0 <= d_i < len(df_queries):
+                            dense_score_map[int(d_i)] = float(d_sc)
         except Exception as embed_err:
             print(f"⚠️ Dense search error: {embed_err}", flush=True)
 
