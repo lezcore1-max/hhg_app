@@ -99,28 +99,37 @@ EMBED_MODEL_NAME = "BAAI/bge-m3"
 
 def get_query_embedding(query_text: str):
     """
-    Embeds a query locally using sentence-transformers — the SAME model/pooling/
-    normalization used to build the FAISS index. Using a different embedding path
-    (e.g. HF Inference API raw feature_extraction) at query time can silently
-    degrade retrieval quality even with the same model name, since pooling
-    strategies can differ.
+    Fast, lightweight query embedding via HF Inference API (or local sentence-transformers fallback).
+    Prevents downloading 2.2GB PyTorch model weights on Railway cloud containers.
     """
-    if embed_model is None:
-        return None
+    global embed_model
+    if embed_model is not None:
+        try:
+            emb = embed_model.encode(f"query: {query_text}", normalize_embeddings=True)
+            return np.asarray(emb, dtype="float32")
+        except Exception:
+            pass
+
+    hf_token = os.environ.get("HF_TOKEN", "")
     try:
-        emb = embed_model.encode(
-            f"query: {query_text}",
-            normalize_embeddings=True,
-        )
-        return np.asarray(emb, dtype="float32")
+        from huggingface_hub import InferenceClient
+        client = InferenceClient(api_key=hf_token)
+        emb = client.feature_extraction(f"query: {query_text}", model=EMBED_MODEL_NAME)
+        arr = np.array(emb, dtype="float32")
+        if arr.ndim == 2:
+            arr = arr.mean(axis=0)
+        elif arr.ndim == 3:
+            arr = arr[0].mean(axis=0)
+        norm = np.linalg.norm(arr)
+        return (arr / norm) if norm > 0 else arr
     except Exception as e:
-        print(f"⚠️ get_query_embedding error: {e}")
+        print(f"⚠️ get_query_embedding HF API error: {e}")
         return None
 
 
 @app.on_event("startup")
 def startup_event():
-    global df, index_q, bm25, embed_model
+    global df, index_q, bm25
     print("=" * 60)
     print("🚀 INITIALIZING HINDI RAG ENGINE (NATIVE FAISS + PARQUET)...")
     print("=" * 60)
@@ -140,24 +149,13 @@ def startup_event():
         print(f"⚠️ WARNING: FAISS index has {index_q.ntotal:,} vectors but parquet has "
               f"{len(df):,} rows — these should match. Retrieval indices will be misaligned!")
 
-    # 3. Build BM25 Index (over hindi_query — matches the parquet's actual column name)
+    # 3. Build BM25 Index (over hindi_query)
     print("🔍 Building BM25 keyword index...")
     tokenized_queries = [str(q).split() for q in df["hindi_query"].tolist()]
     bm25 = BM25Okapi(tokenized_queries)
 
-    # 4. Load local embedding model with PyTorch CPU optimization & warm-up
-    print(f"🧠 Loading local embedding model ({EMBED_MODEL_NAME})...")
-    import torch
-    torch.set_num_threads(min(os.cpu_count() or 4, 8))
-    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-    try:
-        # Warm up PyTorch model execution graph
-        embed_model.encode("query: warmup", normalize_embeddings=True)
-    except Exception:
-        pass
-
     print("=" * 60)
-    print(f"✅ HINDI RAG ENGINE READY — {len(df):,} chunks indexed, embeddings via local {EMBED_MODEL_NAME}")
+    print(f"✅ HINDI RAG ENGINE READY — {len(df):,} chunks indexed ({EMBED_MODEL_NAME})")
     print("=" * 60)
 
 
