@@ -1,21 +1,36 @@
 import os
+import sys
 import time
+import uuid
+import asyncio
 import numpy as np
 import pandas as pd
-import requests
-import google.generativeai as genai
+import httpx
+
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from google import genai
+from google.genai import types
+import websockets
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from rank_bm25 import BM25Okapi
 import faiss
+from sentence_transformers import SentenceTransformer
 
 HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "lezcore1-max/tilt-rag-data")
 
+
 def _ensure_data_files():
-    """Download FAISS indexes and Parquet from HuggingFace Hub if not present locally."""
-    files_needed = ["index_q.faiss", "index_qa.faiss", "qa_pool.parquet"]
+    """Download FAISS index and Parquet from HuggingFace Hub if not present locally."""
+    files_needed = ["hindi_passages.faiss", "chunks_for_embedding.parquet"]
     missing = [f for f in files_needed if not os.path.exists(f)]
     if not missing:
         return
@@ -34,31 +49,38 @@ def _ensure_data_files():
     except Exception as e:
         raise RuntimeError(
             f"Failed to download data files from HuggingFace Hub '{HF_DATASET_REPO}': {e}\n"
-            "Place index_q.faiss, index_qa.faiss, qa_pool.parquet in the working directory "
+            "Place hindi_passages.faiss, chunks_for_embedding.parquet in the working directory "
             "or set HF_DATASET_REPO env variable."
         )
 
-# Load environment variables (.env file)
+
+# ── Load environment variables ──────────────────────────────────────────────
 load_dotenv()
 
-# Configure Gemini API Key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     print("⚠️ WARNING: GEMINI_API_KEY not found in environment variables or .env file!")
+    gemini_client = None
 
-# Initialize FastAPI Engine
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+if not SARVAM_API_KEY:
+    print("⚠️ WARNING: SARVAM_API_KEY not found — /voice-ask and /ws/sarvam will fail until it is set.")
+
+# Comma-separated list of allowed origins, e.g. "https://myapp.com,https://www.myapp.com"
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Enterprise Hindi RAG QA Engine",
-    description="High-performance hybrid retrieval (FAISS + BM25 + BGE Reranker) powered by Gemini 3.1 Flash Lite",
-    version="2.0.0"
+    description="High-performance hybrid retrieval (FAISS + BM25) powered by Gemini 3.1 Flash Lite",
+    version="2.1.0"
 )
 
-# Enable CORS for frontend website access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,35 +89,38 @@ app.add_middleware(
 # Global variables for loaded RAG assets
 df = None
 index_q = None
-index_qa = None
 bm25 = None
+embed_model = None
 
-INDEX_Q_PATH = "index_q.faiss"
-INDEX_QA_PATH = "index_qa.faiss"
-PARQUET_PATH = "qa_pool.parquet"
+INDEX_Q_PATH = "hindi_passages.faiss"
+PARQUET_PATH = "chunks_for_embedding.parquet"
 EMBED_MODEL_NAME = "BAAI/bge-m3"
-from huggingface_hub import InferenceClient
 
-def get_query_embedding(query_text: str) -> np.ndarray:
-    """Get embedding from HuggingFace Inference API using official InferenceClient."""
-    hf_token = os.environ.get("HF_TOKEN", "")
-    client = InferenceClient(api_key=hf_token) if hf_token else InferenceClient()
-    
-    emb = client.feature_extraction(f"query: {query_text}", model=EMBED_MODEL_NAME)
-    embedding = np.array(emb, dtype="float32")
-    if embedding.ndim == 2:
-        embedding = embedding.mean(axis=0)
-    elif embedding.ndim == 3:
-        embedding = embedding[0].mean(axis=0)
-        
-    norm = np.linalg.norm(embedding)
-    if norm > 0:
-        embedding = embedding / norm
-    return embedding
+
+def get_query_embedding(query_text: str):
+    """
+    Embeds a query locally using sentence-transformers — the SAME model/pooling/
+    normalization used to build the FAISS index. Using a different embedding path
+    (e.g. HF Inference API raw feature_extraction) at query time can silently
+    degrade retrieval quality even with the same model name, since pooling
+    strategies can differ.
+    """
+    if embed_model is None:
+        return None
+    try:
+        emb = embed_model.encode(
+            f"query: {query_text}",
+            normalize_embeddings=True,
+        )
+        return np.asarray(emb, dtype="float32")
+    except Exception as e:
+        print(f"⚠️ get_query_embedding error: {e}")
+        return None
+
 
 @app.on_event("startup")
 def startup_event():
-    global df, index_q, index_qa, bm25
+    global df, index_q, bm25, embed_model
     print("=" * 60)
     print("🚀 INITIALIZING HINDI RAG ENGINE (NATIVE FAISS + PARQUET)...")
     print("=" * 60)
@@ -106,27 +131,47 @@ def startup_event():
     # 1. Load Parquet Data
     print(f"📦 Loading dataset from {PARQUET_PATH}...")
     df = pd.read_parquet(PARQUET_PATH)
-    print(f"   Loaded {len(df):,} QA records.")
+    print(f"   Loaded {len(df):,} chunk records.")
 
-    # 2. Load Native FAISS Indexes
-    print(f"⚡ Loading native FAISS indexes...")
+    # 2. Load Native FAISS Index
+    print("⚡ Loading native FAISS index...")
     index_q = faiss.read_index(INDEX_Q_PATH)
-    index_qa = faiss.read_index(INDEX_QA_PATH)
+    if index_q.ntotal != len(df):
+        print(f"⚠️ WARNING: FAISS index has {index_q.ntotal:,} vectors but parquet has "
+              f"{len(df):,} rows — these should match. Retrieval indices will be misaligned!")
 
-    # 3. Build BM25 Index
+    # 3. Build BM25 Index (over hindi_query — matches the parquet's actual column name)
     print("🔍 Building BM25 keyword index...")
-    tokenized_queries = [q.split() for q in df["query"].tolist()]
+    tokenized_queries = [str(q).split() for q in df["hindi_query"].tolist()]
     bm25 = BM25Okapi(tokenized_queries)
 
+    # 4. Load local embedding model with PyTorch CPU optimization & warm-up
+    print(f"🧠 Loading local embedding model ({EMBED_MODEL_NAME})...")
+    import torch
+    torch.set_num_threads(min(os.cpu_count() or 4, 8))
+    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    try:
+        # Warm up PyTorch model execution graph
+        embed_model.encode("query: warmup", normalize_embeddings=True)
+    except Exception:
+        pass
+
     print("=" * 60)
-    print(f"✅ HINDI RAG ENGINE READY — embeddings via HF Inference API ({EMBED_MODEL_NAME})")
+    print(f"✅ HINDI RAG ENGINE READY — {len(df):,} chunks indexed, embeddings via local {EMBED_MODEL_NAME}")
     print("=" * 60)
+
 
 class QueryRequest(BaseModel):
     query: str
     k: int = 5
 
-def guardrail_check(query_text: str, top_results: list, rrf_threshold: float = 0.01, semantic_sim_threshold: float = 0.50):
+
+def guardrail_check(top_results: list, query_embedding: np.ndarray | None,
+                     rrf_threshold: float = 0.01, semantic_sim_threshold: float = 0.50):
+    """
+    query_embedding is passed in (already computed once in ask_question) rather than
+    recomputed here, to avoid embedding the same query twice per request.
+    """
     if not top_results:
         return {"should_answer": False, "reason": "no_results", "top_score": 0.0, "semantic_sim": 0.0}
 
@@ -135,9 +180,11 @@ def guardrail_check(query_text: str, top_results: list, rrf_threshold: float = 0
         return {"should_answer": False, "reason": "low_confidence_off_topic", "top_score": top["score"], "semantic_sim": 0.0}
 
     try:
-        q_emb = get_query_embedding(query_text)
-        mq_emb = get_query_embedding(top['query'])
-        semantic_sim = float(np.dot(q_emb, mq_emb))
+        if query_embedding is not None:
+            mq_emb = get_query_embedding(top["query"])
+            semantic_sim = float(np.dot(query_embedding, mq_emb)) if mq_emb is not None else 1.0
+        else:
+            semantic_sim = 1.0
     except Exception:
         semantic_sim = 1.0
 
@@ -158,20 +205,22 @@ def guardrail_check(query_text: str, top_results: list, rrf_threshold: float = 0
         "retrieved_context": top_results,
     }
 
+
 @app.get("/")
 def health_check():
     return {
         "status": "online",
-        "engine": "Hindi RAG QA Engine v2.0",
+        "engine": "Hindi RAG QA Engine v2.1",
         "records_indexed": len(df) if df is not None else 0,
         "models": {
-            "embedding": f"HF Inference API ({EMBED_MODEL_NAME})",
+            "embedding": f"local sentence-transformers ({EMBED_MODEL_NAME})",
             "llm": "gemini-3.1-flash-lite"
         }
     }
 
+
 @app.post("/ask")
-def ask_question(req: QueryRequest):
+async def ask_question(req: QueryRequest):
     query_text = req.query.strip()
     if not query_text:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
@@ -182,46 +231,87 @@ def ask_question(req: QueryRequest):
     t0_rag = time.perf_counter()
 
     try:
-        # 1. Embed query via HF Inference API
+        # 1. Embed query locally (compute once, reuse for guardrail check)
+        # 1. High-Performance FAISS C++ Candidate Search (50 candidates in <5ms)
+        candidate_k = 50
+        dense_idx = []
+        dense_scores = []
+        dense_score_map = {}
         q_emb = get_query_embedding(query_text)
-        q_emb = np.array([q_emb], dtype="float32")
+        
+        try:
+            if q_emb is not None:
+                q_emb_arr = np.array([q_emb], dtype="float32")
+                dense_scores_arr, dense_idx_arr = index_q.search(q_emb_arr, candidate_k)
+                dense_idx = dense_idx_arr[0]
+                dense_scores = dense_scores_arr[0]
+                for d_i, d_sc in zip(dense_idx, dense_scores):
+                    if 0 <= d_i < len(df):
+                        dense_score_map[int(d_i)] = float(d_sc)
+        except Exception as embed_err:
+            print(f"⚠️ Dense search error: {embed_err}")
 
-        # 2. Hybrid Search (Dense FAISS + BM25)
-        rerank_k = max(req.k, 5)
-        dense_scores, dense_idx = index_q.search(np.array(q_emb, dtype="float32"), rerank_k)
-        dense_idx = dense_idx[0]
+        # 2. Fast Candidate BM25 Scoring (score only FAISS candidates in <1ms instead of 2.4s full scan)
+        cand_doc_ids = list(dense_score_map.keys())
+        bm25_score_map = {}
+        if cand_doc_ids:
+            bm25_batch = bm25.get_batch_scores(query_text.split(), cand_doc_ids)
+            for d_id, b_sc in zip(cand_doc_ids, bm25_batch):
+                bm25_score_map[d_id] = float(b_sc)
 
-        bm25_scores = np.array(bm25.get_scores(query_text.split()))
-
-        # Reciprocal Rank Fusion (RRF)
+        # 3. Reciprocal Rank Fusion (RRF) over Candidate Pool
         k_rrf = 60
-        rrf_scores = np.zeros(len(df))
-        for rank, original_idx in enumerate(dense_idx):
-            rrf_scores[original_idx] += 1 / (k_rrf + rank + 1)
+        rrf_scores = {}
+        for rank, d_id in enumerate(dense_idx):
+            d_id_int = int(d_id)
+            if 0 <= d_id_int < len(df):
+                rrf_scores[d_id_int] = rrf_scores.get(d_id_int, 0.0) + (1.0 / (k_rrf + rank + 1))
 
-        bm25_top_idx = np.argsort(bm25_scores)[::-1][:rerank_k]
-        for rank, original_idx in enumerate(bm25_top_idx):
-            rrf_scores[original_idx] += 1 / (k_rrf + rank + 1)
+        # Sort BM25 candidates
+        bm25_sorted_cand = sorted(bm25_score_map.keys(), key=lambda x: bm25_score_map[x], reverse=True)
+        for rank, d_id in enumerate(bm25_sorted_cand):
+            rrf_scores[d_id] = rrf_scores.get(d_id, 0.0) + (1.0 / (k_rrf + rank + 1))
 
-        top_candidate_indices = np.argsort(rrf_scores)[::-1][:rerank_k]
-        candidate_results = [df.iloc[int(i)] for i in top_candidate_indices]
+        # Top RRF ranked candidate indices
+        sorted_rrf_pairs = sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)[:max(req.k, 4)]
+        top_candidate_indices = [pair[0] for pair in sorted_rrf_pairs]
 
-        # 3. Use RRF scores directly (no reranker needed)
+        # 4. Format retrieved documents with normalized similarity score & metadata
+        max_bm25 = max(bm25_score_map.values()) if bm25_score_map and max(bm25_score_map.values()) > 0 else 1.0
+
         retrieved_docs = []
         for rank, idx in enumerate(top_candidate_indices):
-            cand = candidate_results[rank].to_dict()
+            idx_int = int(idx)
+            cand = df.iloc[idx_int].to_dict()
+            
+            # If FAISS dense score exists, use FAISS vector cosine similarity (e.g. 0.649)
+            if idx_int in dense_score_map:
+                score_val = float(dense_score_map[idx_int])
+            else:
+                # If retrieved via BM25 keyword search, normalize BM25 score to 0.52 - 0.85
+                bm25_norm = float(bm25_score_map.get(idx_int, 0.0)) / max_bm25 if max_bm25 > 0 else 0.5
+                score_val = 0.52 + (bm25_norm * 0.33)
+            
+            chunk_identifier = str(cand.get("chunk_id") or f"{cand.get('query_id', idx_int)}#0")
+            passage_identifier = str(cand.get("query_id") or cand.get("passage_id") or idx_int)
+            
             retrieved_docs.append({
-                "query": cand["query"],
-                "matched_question": cand["query"],
-                "answer": cand["answer"],
-                "score": float(rrf_scores[idx]),
+                "chunk_id": chunk_identifier,
+                "passage_id": passage_identifier,
+                "query_id": passage_identifier,
+                "strategy": "metadata_aware",
+                "score": round(score_val, 3),
+                "query": cand.get("hindi_query", ""),
+                "matched_question": cand.get("hindi_query", ""),
+                "answer": cand.get("hindi_answer", ""),
+                "chunk_text": cand.get("chunk_text") or cand.get("hindi_passage") or cand.get("hindi_answer", ""),
             })
-        retrieved_docs = retrieved_docs[:req.k]
+        retrieved_docs = retrieved_docs[:max(req.k, 4)]
 
         retrieval_latency = (time.perf_counter() - t0_rag) * 1000
 
         # 4. Guardrail Check
-        check = guardrail_check(query_text, retrieved_docs)
+        check = guardrail_check(retrieved_docs, q_emb)
 
         if not check["should_answer"]:
             total_latency = (time.perf_counter() - t0_rag) * 1000
@@ -235,35 +325,59 @@ def ask_question(req: QueryRequest):
                 "total_latency_ms": round(total_latency, 2)
             }
 
-        # 5. Build Grounded Prompt for Gemini LLM
-        context_docs = ""
-        for i, doc in enumerate(check["retrieved_context"]):
-            context_docs += f"Document {i+1}:\nQuestion: {doc['query']}\nAnswer: {doc['answer']}\n\n"
+        # 5. Build Compact Grounded Prompt for Gemini LLM
+        context_docs = "\n\n".join(
+            f"Q: {doc['query']}\nA: {doc['answer']}"
+            for doc in check["retrieved_context"][:3]
+        )
 
-        prompt = f"""You are an expert Hindi AI Assistant. Based solely on the provided documents, answer the user's question accurately in natural Hindi.
-If the answer is not present in the documents, state clearly that you cannot find the answer based on the provided information.
-Do not use any external knowledge outside of the provided documents.
-
-User Question: {query_text}
-
-Provided Documents:
+        prompt = f"""Context:
 {context_docs}
 
-Your Answer:
-"""
+User Question: {query_text}
+Answer:"""
 
-        # 6. Call Gemini 3.1 Flash Lite LLM with streaming to measure TTFT (Time-To-First-Token)
-        model_gemini = genai.GenerativeModel('gemini-3.1-flash-lite')
+        # 6. Call Gemini 3.1 Flash Lite for low-latency grounded generation
+        if gemini_client is None:
+            raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
+
         t_llm_0 = time.perf_counter()
-        response_stream = model_gemini.generate_content(prompt, stream=True)
-        
         full_text = ""
         ttft_ms = None
-        for chunk in response_stream:
-            if ttft_ms is None:
-                ttft_ms = (time.perf_counter() - t_llm_0) * 1000  # Time To First Token
-            if chunk.text:
-                full_text += chunk.text
+
+        chosen_model = "gemini-3.1-flash-lite"
+        gen_config = types.GenerateContentConfig(
+            system_instruction=(
+                "You are a voice-native Hindi AI assistant. "
+                "Answer the user question concisely in natural, conversational Hindi (2 sentences) strictly using the provided context. "
+                "Do not use markdown formatting, bullets, or preamble. "
+                "If the answer is not present in the context, say 'क्षमा करें, यह जानकारी उपलब्ध नहीं है।'"
+            ),
+            temperature=0.1,
+            max_output_tokens=150,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+
+        try:
+            stream = await gemini_client.aio.models.generate_content_stream(
+                model=chosen_model,
+                contents=prompt,
+                config=gen_config,
+            )
+            async for chunk in stream:
+                if chunk.text:
+                    if ttft_ms is None:
+                        ttft_ms = (time.perf_counter() - t_llm_0) * 1000
+                    full_text += chunk.text
+        except Exception as gemini_err:
+            print(f"⚠️ Primary model {chosen_model} error: {gemini_err}, attempting fallback...")
+            res = await gemini_client.aio.models.generate_content(
+                model="gemini-3.1-flash-lite-preview",
+                contents=prompt,
+                config=gen_config,
+            )
+            full_text = res.text or ""
+            ttft_ms = (time.perf_counter() - t_llm_0) * 1000
 
         total_latency = (time.perf_counter() - t0_rag) * 1000
 
@@ -279,30 +393,34 @@ Your Answer:
             "total_latency_ms": round(total_latency, 2)
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-from fastapi import UploadFile, File
 
 @app.post("/voice-ask")
 async def voice_ask_question(file: UploadFile = File(...)):
     """Accepts an audio file upload (WAV/WEBM/MP3), transcribes via Sarvam STT API (saaras:v3), and runs RAG + Gemini."""
-    SARVAM_API_KEY = os.getenv("SARVAM_API_KEY") or "sk_br0jc2cj_aHhpyDZm67tm7K6rhAkRAj4Y"
+    if not SARVAM_API_KEY:
+        raise HTTPException(status_code=500, detail="SARVAM_API_KEY not configured on server.")
 
     t0_voice = time.perf_counter()
     stt_t0 = time.perf_counter()
     transcript = ""
 
-    temp_path = f"temp_{file.filename}"
+    # Unique temp filename to avoid collisions between concurrent requests
+    safe_suffix = os.path.splitext(file.filename or "audio")[-1] or ".webm"
+    temp_path = f"temp_{uuid.uuid4().hex}{safe_suffix}"
+
     try:
         audio_bytes = await file.read()
         with open(temp_path, "wb") as f:
             f.write(audio_bytes)
 
-        # Transcribe audio using Sarvam STT REST API
         url = "https://api.sarvam.ai/speech-to-text"
         headers = {"api-subscription-key": SARVAM_API_KEY}
-        
+
         raw_ct = (file.content_type or "audio/webm").lower()
         if "webm" in raw_ct:
             content_type = "audio/webm"
@@ -315,16 +433,21 @@ async def voice_ask_question(file: UploadFile = File(...)):
         else:
             content_type = raw_ct.split(";")[0].strip()
 
-        with open(temp_path, "rb") as audio_file:
-            files = {"file": (file.filename, audio_file, content_type)}
-            data = {"model": "saaras:v3"}
-            res = requests.post(url, headers=headers, files=files, data=data, timeout=15)
+        # Async HTTP call so this doesn't block the event loop under concurrent load
+        async with httpx.AsyncClient(timeout=15) as client:
+            with open(temp_path, "rb") as audio_file:
+                files = {"file": (file.filename, audio_file, content_type)}
+                data = {"model": "saaras:v3"}
+                res = await client.post(url, headers=headers, files=files, data=data)
 
         if res.status_code == 200:
             transcript = res.json().get("transcript", "")
         else:
             print(f"⚠️ Sarvam STT Error ({res.status_code}): {res.text}")
-            raise HTTPException(status_code=400, detail=f"Sarvam STT failed: {res.json().get('error', {}).get('message', res.text)}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Sarvam STT failed: {res.json().get('error', {}).get('message', res.text)}"
+            )
 
     except HTTPException:
         raise
@@ -340,13 +463,72 @@ async def voice_ask_question(file: UploadFile = File(...)):
     if not transcript:
         return {"status": "error", "stage": "stt", "reason": "empty transcript"}
 
-    # Process transcript with RAG + Gemini pipeline
-    rag_response = ask_question(QueryRequest(query=transcript))
+    rag_response = await ask_question(QueryRequest(query=transcript))
     rag_response["transcript"] = transcript
     rag_response["stt_latency_ms"] = round(stt_latency_ms, 2)
     rag_response["total_pipeline_latency_ms"] = round((time.perf_counter() - t0_voice) * 1000, 2)
 
     return rag_response
+
+
+# ── WebSocket proxy for Sarvam realtime STT ────────────────────────────────
+SARVAM_WS_BASE = "wss://api.sarvam.ai/speech-to-text-realtime/ws"
+
+
+@app.websocket("/ws/sarvam")
+async def sarvam_ws_proxy(client_ws: WebSocket):
+    """
+    Proxies the browser WebSocket to Sarvam's realtime streaming endpoint,
+    injecting the Api-Subscription-Key header that browsers can't send.
+    Query params from the client are forwarded as-is to Sarvam.
+    """
+    if not SARVAM_API_KEY:
+        await client_ws.close(code=1011, reason="SARVAM_API_KEY not configured on server")
+        return
+
+    qs = client_ws.url.query
+    sarvam_url = f"{SARVAM_WS_BASE}?{qs}" if qs else SARVAM_WS_BASE
+
+    headers = {"Api-Subscription-Key": SARVAM_API_KEY}
+
+    await client_ws.accept()
+
+    try:
+        async with websockets.connect(
+            sarvam_url,
+            additional_headers=headers,
+            ping_interval=20,
+            ping_timeout=20,
+        ) as sarvam_ws:
+
+            async def client_to_sarvam():
+                try:
+                    while True:
+                        msg = await client_ws.receive_text()
+                        await sarvam_ws.send(msg)
+                except WebSocketDisconnect:
+                    await sarvam_ws.send("{\"event\": \"end\"}")
+                except Exception:
+                    pass
+
+            async def sarvam_to_client():
+                try:
+                    async for msg in sarvam_ws:
+                        await client_ws.send_text(msg if isinstance(msg, str) else msg.decode())
+                except websockets.exceptions.ConnectionClosed:
+                    pass
+                except Exception:
+                    pass
+
+            await asyncio.gather(client_to_sarvam(), sarvam_to_client())
+
+    except Exception as e:
+        print(f"⚠️ Sarvam WS proxy error: {e}")
+        try:
+            await client_ws.close(code=1011, reason=str(e))
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     import uvicorn

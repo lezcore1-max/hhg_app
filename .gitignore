@@ -9,18 +9,25 @@ venv/
 .env
 # .env.example is safe to commit (no real keys)
 
-# Large training data files (not needed for inference)
+# Large binary & parquet dataset files (downloaded automatically from HF Hub on startup)
+*.parquet
+*.faiss
+*.npy
+*.pkl
 asmtrain.parquet
 hintrain.parquet
 hinval.parquet
 qa_retriever_cache.pkl
 final_data.csv
+test_load.py
 
-# Notebooks
+# Notebooks & Scratch
 *.ipynb
+scratch/
 
-# Node
+# Node & Sub-frontend repo
 node_modules/
+hhg-main/
 
 # Local IDE
 .vscode/
