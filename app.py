@@ -3,17 +3,10 @@ import sys
 import time
 import uuid
 import asyncio
-import threading
 import numpy as np
 import pandas as pd
 import httpx
-import requests
-import pyarrow.dataset as ds
-from huggingface_hub import hf_hub_download
-from dotenv import load_dotenv
 
-
-# ── Windows UTF-8 console fix ──────────────────────────────────────────────
 if sys.platform.startswith("win"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -21,39 +14,81 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
-# ── Load environment variables ──────────────────────────────────────────────
-load_dotenv()
-
-
-
 from google import genai
 from google.genai import types
 import websockets
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from rank_bm25 import BM25Okapi
 import faiss
 
-# ── Configuration Constants ──────────────────────────────────────────────────
 HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "lezcore1-max/tilt-rag-data")
+
+# Persistent data directory — use Railway Volume (/app/data) if available, else current dir
 DATA_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.isdir("/app/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 print(f"[INIT] Using data directory: {DATA_DIR}", flush=True)
 
-INDEX_Q_PATH = os.path.join(DATA_DIR, "small_hindi_passages.faiss")
-PARQUET_PATH = os.path.join(DATA_DIR, "chunks_for_embedding.parquet")
-EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"  # 384-dim lightweight embedding model
-VECTOR_DIM = 384  # multilingual-e5-small output dimension
 
-# Devanagari script-aware tokenization regex (preserves Devanagari matras and viramas)
-import re
-HINDI_TOKEN_REGEX = re.compile(r'[^\s\.,;!?।॥\(\)\[\]\{\}"\':]+')
+def _download_file_with_progress(url: str, dest_path: str, fname: str):
+    """Download a file via HTTP with live MB progress logging for cloud containers."""
+    import requests
+    response = requests.get(url, stream=True, timeout=60)
+    response.raise_for_status()
+    total_size = int(response.headers.get('content-length', 0))
+    total_mb = total_size / (1024 * 1024)
+    
+    downloaded = 0
+    last_log_mb = 0
+    with open(dest_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+                current_mb = downloaded / (1024 * 1024)
+                if current_mb - last_log_mb >= 50 or downloaded == total_size:
+                    pct = (downloaded / total_size * 100) if total_size > 0 else 0
+                    print(f"   ⬇️ {fname}: {current_mb:.1f} MB / {total_mb:.1f} MB ({pct:.1f}%)", flush=True)
+                    last_log_mb = current_mb
 
-def tokenize_hindi(text: str) -> list[str]:
-    """Preserves full Devanagari words without shattering vowels or viramas."""
-    return HINDI_TOKEN_REGEX.findall(str(text).lower())
 
+def _ensure_data_files():
+    """Download FAISS index and Parquet from HuggingFace Hub with live MB logs."""
+    model_dir = os.path.join(DATA_DIR, "onnx")
+    if not os.path.exists(os.path.join(model_dir, "model.onnx")):
+        print("⬇️ Downloading ONNX model for embeddings...", flush=True)
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id="intfloat/multilingual-e5-small", 
+                          allow_patterns=["*.onnx", "tokenizer.json"],
+                          local_dir=model_dir)
+        print("✅ ONNX model ready!", flush=True)
+
+    files_needed = ["small_hindi_passages.faiss", "chunks_for_embedding.parquet"]
+    missing = [f for f in files_needed if not os.path.exists(os.path.join(DATA_DIR, f))]
+    if not missing:
+        print(f"✅ All required data files already exist in {DATA_DIR}. Skipping download.", flush=True)
+        return
+        
+    print(f"⬇️ Data files missing: {missing}. Downloading from HuggingFace Hub ({HF_DATASET_REPO})...", flush=True)
+    for fname in missing:
+        url = f"https://huggingface.co/datasets/{HF_DATASET_REPO}/resolve/main/{fname}"
+        dest_path = os.path.join(DATA_DIR, fname)
+        print(f"   ⏳ Starting download for {fname} -> {dest_path}...", flush=True)
+        try:
+            _download_file_with_progress(url, dest_path, fname)
+            print(f"   ✅ {fname} ready!", flush=True)
+        except Exception as e:
+            print(f"⚠️ Direct download failed for {fname} ({e}), trying fallback hf_hub_download...", flush=True)
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(repo_id=HF_DATASET_REPO, filename=fname, repo_type="dataset", local_dir=DATA_DIR)
+            print(f"   ✅ {fname} ready via fallback!", flush=True)
+
+
+
+# ── Load environment variables ──────────────────────────────────────────────
+load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if GEMINI_API_KEY:
@@ -66,13 +101,14 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 if not SARVAM_API_KEY:
     print("⚠️ WARNING: SARVAM_API_KEY not found — /voice-ask and /ws/sarvam will fail until it is set.", flush=True)
 
+# Comma-separated list of allowed origins, e.g. "https://myapp.com,https://www.myapp.com"
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 
-# ── FastAPI App ──────────────────────────────────────────────────────────────
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Enterprise Hindi RAG QA Engine",
-    description="High-performance hybrid retrieval (FAISS + BM25) powered by intfloat/multilingual-e5-small and Gemini 3.1 Flash Lite",
-    version="2.2.0"
+    description="High-performance hybrid retrieval (FAISS + BM25) powered by Gemini 3.1 Flash Lite",
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -83,116 +119,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Global Engine State ──────────────────────────────────────────────────────
-corpus_chunk_ids = None
-corpus_queries = None
-corpus_answers = None
-total_records = 0
+# Global variables for loaded RAG assets
+df_queries = None
+parquet_dataset = None
 mmap_vectors = None
 index_q = None
 bm25 = None
-onnx_session = None
-onnx_tokenizer = None
+
+INDEX_Q_PATH = os.path.join(DATA_DIR, "small_hindi_passages.faiss")
+PARQUET_PATH = os.path.join(DATA_DIR, "chunks_for_embedding.parquet")
+EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"  # 384-dim, lightweight
+VECTOR_DIM = 384  # multilingual-e5-small output dimension
+
+
+
+_onnx_session = None
+_tokenizer = None
+
+def get_query_embedding(query_text: str):
+    """Lightweight query embedding via local ONNX runtime (intfloat/multilingual-e5-small, 384-dim)."""
+    global _onnx_session, _tokenizer
+    if _onnx_session is None:
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+        model_dir = os.path.join(DATA_DIR, "onnx")
+        _tokenizer = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
+        _onnx_session = ort.InferenceSession(os.path.join(model_dir, "model.onnx"), providers=['CPUExecutionProvider'])
+        
+    try:
+        # Prepend query: as required by E5
+        encoded = _tokenizer.encode(f"query: {query_text}")
+        
+        # Tokenizer returns ids and attention_mask
+        input_ids = np.array([encoded.ids], dtype=np.int64)
+        attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
+        
+        # We also need token_type_ids for this model (usually all zeros)
+        token_type_ids = np.zeros_like(input_ids)
+        
+        outputs = _onnx_session.run(None, {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids
+        })
+        
+        token_embeddings = outputs[0]
+        
+        # Mean pooling
+        input_mask_expanded = np.broadcast_to(np.expand_dims(attention_mask, -1), token_embeddings.shape)
+        sum_embeddings = np.sum(token_embeddings * input_mask_expanded, axis=1)
+        sum_mask = np.clip(np.sum(input_mask_expanded, axis=1), a_min=1e-9, a_max=None)
+        arr = sum_embeddings / sum_mask
+        arr = arr[0]
+        
+        norm = np.linalg.norm(arr)
+        return (arr / norm) if norm > 0 else arr
+    except Exception as e:
+        print(f"⚠️ get_query_embedding error: {e}", flush=True)
+        return None
+
+
+import pyarrow.dataset as ds
+
+def fetch_candidate_rows_on_demand(top_indices: list):
+    """Fetch ONLY the top retrieved candidate rows directly from disk without RAM footprint."""
+    if not top_indices or parquet_dataset is None:
+        return {}
+    valid_indices = [int(i) for i in top_indices if 0 <= int(i) < len(df_queries)]
+    if not valid_indices:
+        return {}
+    try:
+        table = parquet_dataset.take(valid_indices)
+        rows_list = table.to_pandas().to_dict("records")
+        return {idx: row for idx, row in zip(valid_indices, rows_list)}
+    except Exception as err:
+        print(f"⚠️ fetch_candidate_rows_on_demand error: {err}", flush=True)
+        return {}
+
+
+import threading
+
+# Track engine readiness (set to True once all data is loaded)
 _engine_ready = False
 _engine_error = None
 
 
-
-
-
-# ── Data Download Utility ───────────────────────────────────────────────────
-def _ensure_data_files():
-    """Download FAISS index and Parquet from HuggingFace Hub with fast download."""
-    from huggingface_hub import hf_hub_download
-
-    # Clean up old large 2GB FAISS index if present to free disk space
-    old_files = ["hindi_passages.faiss"]
-    for old_f in old_files:
-        old_path = os.path.join(DATA_DIR, old_f)
-        if os.path.exists(old_path):
-            print(f"🧹 Removing old file {old_f} to free disk space...", flush=True)
-            try:
-                os.remove(old_path)
-                print(f"   ✅ Removed {old_f}", flush=True)
-            except Exception as e:
-                print(f"   ⚠️ Could not remove {old_f}: {e}", flush=True)
-
-    expected_min_sizes = {
-        "small_hindi_passages.faiss": 700 * 1024 * 1024,  # ~782.8 MB
-        "chunks_for_embedding.parquet": 100 * 1024 * 1024  # ~149.5 MB
-    }
-
-    files_needed = ["small_hindi_passages.faiss", "chunks_for_embedding.parquet"]
-    for fname in files_needed:
-        fpath = os.path.join(DATA_DIR, fname)
-        min_sz = expected_min_sizes.get(fname, 0)
-        if not os.path.exists(fpath) or os.path.getsize(fpath) < min_sz:
-            if os.path.exists(fpath):
-                print(f"⚠️ Existing {fname} is incomplete ({os.path.getsize(fpath):,} bytes < {min_sz:,} bytes). Re-downloading...", flush=True)
-                try:
-                    os.remove(fpath)
-                except Exception:
-                    pass
-            print(f"⬇️ Downloading {fname} from HuggingFace Hub ({HF_DATASET_REPO})...", flush=True)
-            hf_hub_download(
-                repo_id=HF_DATASET_REPO,
-                filename=fname,
-                repo_type="dataset",
-                local_dir=DATA_DIR,
-                token=os.getenv("HF_TOKEN")
-            )
-            print(f"   ✅ {fname} ready ({os.path.getsize(fpath):,} bytes)!", flush=True)
-        else:
-            print(f"✅ {fname} exists ({os.path.getsize(fpath):,} bytes). Skipping download.", flush=True)
-
-
-# ── Query Embedding (Lightweight ONNX multilingual-e5-small ~15MB) ─────────────
-def get_query_embedding(query_text: str):
-    """
-    Generate 384-dim query embedding using ultra-lightweight ONNX Runtime (8-10ms, 15MB disk).
-    No heavy PyTorch/CUDA installation required (fixes AWS disk quota).
-    """
-    global onnx_session, onnx_tokenizer
-    input_text = f"query: {query_text}"
-
-    # 1. Preferred: High-Performance ONNX Runtime (8-10 ms CPU)
-    if onnx_session is not None and onnx_tokenizer is not None:
-        try:
-            enc = onnx_tokenizer.encode(input_text)
-            input_ids = np.array([enc.ids], dtype=np.int64)
-            attention_mask = np.array([enc.attention_mask], dtype=np.int64)
-            
-            input_names = [inp.name for inp in onnx_session.get_inputs()]
-            feed = {"input_ids": input_ids, "attention_mask": attention_mask}
-            if "token_type_ids" in input_names:
-                feed["token_type_ids"] = np.zeros_like(input_ids)
-            
-            outputs = onnx_session.run(None, feed)
-            token_embeddings = outputs[0]  # [1, seq_len, 384]
-
-            
-            # Mean-pool over attention mask
-            mask_exp = np.expand_dims(attention_mask, -1).astype(float)
-            sum_emb = np.sum(token_embeddings * mask_exp, axis=1)
-            sum_mask = np.clip(mask_exp.sum(axis=1), a_min=1e-9, a_max=None)
-            pooled = sum_emb / sum_mask
-            
-            # L2 normalize
-            norm = np.linalg.norm(pooled, axis=1, keepdims=True)
-            norm_pooled = pooled / np.clip(norm, a_min=1e-12, a_max=None)
-            return norm_pooled[0].astype(np.float32)
-        except Exception as e:
-            print(f"⚠️ ONNX encode error: {e}", flush=True)
-
-    return None
-
-
-
-
-# ── Background Engine Initialization ─────────────────────────────────────────
 def _load_rag_engine_background():
     """Run all heavy data loading in a background thread so FastAPI starts instantly."""
-    global corpus_chunk_ids, corpus_queries, corpus_answers, total_records, mmap_vectors, index_q, bm25, embed_model, onnx_session, onnx_tokenizer, _engine_ready, _engine_error
+    global df_queries, parquet_dataset, mmap_vectors, index_q, bm25, _engine_ready, _engine_error
     try:
         print("=" * 60, flush=True)
         print("🚀 INITIALIZING HINDI RAG ENGINE (BACKGROUND THREAD)...", flush=True)
@@ -201,73 +215,42 @@ def _load_rag_engine_background():
         # 0. Auto-download data files from HuggingFace Hub if needed
         _ensure_data_files()
 
-        # 1. Load Parquet columns into RAM (~180 MB RAM total, 0.01ms lookup)
-        print(f"📦 Step 1/3: Loading in-memory corpus index from {PARQUET_PATH}...", flush=True)
-        df_records = pd.read_parquet(PARQUET_PATH, columns=["chunk_id", "hindi_query", "hindi_answer"])
-        corpus_chunk_ids = df_records["chunk_id"].tolist()
-        corpus_queries = df_records["hindi_query"].tolist()
-        corpus_answers = df_records["hindi_answer"].tolist()
-        total_records = len(corpus_queries)
-        del df_records  # Free DataFrame memory overhead
-        print(f"   ✅ Loaded {total_records:,} corpus entries into fast RAM lists (0.01ms lookup)!", flush=True)
+        # 1. Load Parquet Dataset Handle & 1 Lightweight Column
+        print(f"📦 Step 1/3: Loading 1-column query index from {PARQUET_PATH}...", flush=True)
+        parquet_dataset = ds.dataset(PARQUET_PATH, format="parquet")
+        df_queries = pd.read_parquet(PARQUET_PATH, columns=["hindi_query"])
+        total_records = len(df_queries)
+        print(f"   ✅ Loaded {total_records:,} query strings into RAM (~55 MB RAM total)!", flush=True)
 
-        # 2. Memory-Map 384-dim Vector Matrix (0 MB RAM overhead!)
-        print(f"⚡ Step 2/3: Memory-mapping vector matrix from {INDEX_Q_PATH} (dim={VECTOR_DIM})...", flush=True)
+        # 2. Quantize Vector Matrix to int8 in memory (153 MB RAM overhead!)
+        print(f"⚡ Step 2/3: Loading vectors into RAM as int8 from {INDEX_Q_PATH} (dim={VECTOR_DIM})...", flush=True)
         try:
-            mmap_vectors = np.memmap(INDEX_Q_PATH, dtype="float32", mode="r", offset=45, shape=(total_records, VECTOR_DIM))
-            print(f"   ✅ Vector matrix memory-mapped ({total_records:,} vectors × {VECTOR_DIM}-dim, 0 MB RAM)!", flush=True)
+            mmap_float = np.memmap(INDEX_Q_PATH, dtype="float32", mode="r", offset=45, shape=(total_records, VECTOR_DIM))
+            
+            # Allocate int8 array (takes ~153 MB for 400k x 384)
+            vectors_int8 = np.empty((total_records, VECTOR_DIM), dtype=np.int8)
+            
+            # Read in chunks to avoid OOM from huge intermediate arrays
+            chunk_size = 50000
+            for i in range(0, total_records, chunk_size):
+                vectors_int8[i:i+chunk_size] = (mmap_float[i:i+chunk_size] * 127).astype(np.int8)
+                
+            mmap_vectors = vectors_int8
+            del mmap_float
+            print(f"   ✅ Vector matrix loaded as int8 ({total_records:,} vectors × {VECTOR_DIM}-dim, ~153 MB RAM)!", flush=True)
         except Exception as mmap_err:
             print(f"⚠️ Vector mmap fallback ({mmap_err}); loading FAISS index...", flush=True)
             index_q = faiss.read_index(INDEX_Q_PATH)
             print(f"   ✅ FAISS index loaded with {index_q.ntotal:,} vectors!", flush=True)
 
-        # 3. Build BM25 Index with script-aware Devanagari tokenization
-        print("🔍 Step 3/3: Building Devanagari script-aware BM25 keyword index...", flush=True)
-        tokenized_queries = [tokenize_hindi(q) for q in corpus_queries]
-        bm25 = BM25Okapi(tokenized_queries)
-
-        # 4. Load & pre-warm ONNX Embedder (~15MB disk, 8-10ms latency)
-        print(f"🧠 Loading ONNX {EMBED_MODEL_NAME} runtime...", flush=True)
-        try:
-            import onnxruntime as ort
-            from tokenizers import Tokenizer
-
-            # Try local paths first (already downloaded), then HF download
-            _local_onnx = os.path.join(DATA_DIR, "onnx", "model.onnx")
-            _local_tok  = os.path.join(DATA_DIR, "tokenizer.json")
-
-            if os.path.exists(_local_onnx) and os.path.exists(_local_tok):
-                onnx_model_path = _local_onnx
-                onnx_tok_path   = _local_tok
-                print(f"   Using cached ONNX files from {DATA_DIR}", flush=True)
-            else:
-                print("   Downloading ONNX model from HuggingFace Hub...", flush=True)
-                onnx_model_path = hf_hub_download(EMBED_MODEL_NAME, "onnx/model.onnx", local_dir=DATA_DIR)
-                onnx_tok_path   = hf_hub_download(EMBED_MODEL_NAME, "tokenizer.json",  local_dir=DATA_DIR)
-
-            onnx_tokenizer = Tokenizer.from_file(onnx_tok_path)
-            onnx_tokenizer.enable_truncation(max_length=512)
-
-            sess_opts = ort.SessionOptions()
-            sess_opts.intra_op_num_threads = 4
-            onnx_session = ort.InferenceSession(onnx_model_path, sess_opts, providers=["CPUExecutionProvider"])
-
-            # Warm up and verify
-            test_emb = get_query_embedding("warm up test")
-            if test_emb is None:
-                raise RuntimeError("ONNX warm-up returned None — session may be broken")
-            print(f"   ✅ ONNX ready! Query embedding: {test_emb.shape}, norm={float(np.linalg.norm(test_emb)):.4f}", flush=True)
-        except Exception as onnx_err:
-            print(f"   🚨 ONNX load FAILED: {onnx_err}", flush=True)
-            import traceback; traceback.print_exc()
-
+        # 3. Build BM25 Index
+        print("🔍 Step 3/3: Building BM25 keyword index...", flush=True)
+        bm25 = BM25Okapi((str(q).split() for q in df_queries["hindi_query"]))
 
         _engine_ready = True
-
         print("=" * 60, flush=True)
-        print(f"🎯 HHG RAG ENGINE READY — {total_records:,} chunks indexed ({EMBED_MODEL_NAME})!", flush=True)
+        print(f"🎯 HHG RAG ENGINE READY — {total_records:,} chunks indexed!", flush=True)
         print("=" * 60, flush=True)
-
 
     except Exception as e:
         _engine_error = str(e)
@@ -282,55 +265,57 @@ def startup_event():
     t.start()
 
 
-# ── Request / Guardrail Schemas ──────────────────────────────────────────────
+
 class QueryRequest(BaseModel):
     query: str
     k: int = 5
 
 
-def guardrail_check(top_results: list, top_sim_score: float = 0.0,
-                     rrf_threshold: float = 0.01, semantic_sim_threshold: float = 0.45):
+def guardrail_check(top_results: list, query_embedding: np.ndarray | None,
+                     rrf_threshold: float = 0.01, semantic_sim_threshold: float = 0.50):
     if not top_results:
         return {"should_answer": False, "reason": "no_results", "top_score": 0.0, "semantic_sim": 0.0}
 
     top = top_results[0]
-    score_val = float(top.get("score", 0.0))
-    semantic_sim = float(top_sim_score) if top_sim_score > 0 else score_val
+    if top["score"] < rrf_threshold:
+        return {"should_answer": False, "reason": "low_confidence_off_topic", "top_score": top["score"], "semantic_sim": 0.0}
 
-    if score_val < rrf_threshold or semantic_sim < semantic_sim_threshold:
+    try:
+        if query_embedding is not None:
+            mq_emb = get_query_embedding(top["query"])
+            semantic_sim = float(np.dot(query_embedding, mq_emb)) if mq_emb is not None else 1.0
+        else:
+            semantic_sim = 1.0
+    except Exception:
+        semantic_sim = 1.0
+
+    if semantic_sim < semantic_sim_threshold:
         return {
             "should_answer": False,
-            "reason": "low_confidence_off_topic" if score_val < rrf_threshold else "semantic_mismatch",
-            "top_score": round(score_val, 3),
+            "reason": "semantic_mismatch",
+            "top_score": top["score"],
             "semantic_sim": round(semantic_sim, 3),
         }
 
     return {
         "should_answer": True,
         "reason": "grounded",
-        "top_score": round(score_val, 3),
+        "top_score": top["score"],
         "semantic_sim": round(semantic_sim, 3),
         "grounded_answer": top["answer"],
         "retrieved_context": top_results,
     }
 
 
-
-# ── API Endpoints ────────────────────────────────────────────────────────────
 @app.get("/")
 @app.get("/health")
 def health_check():
-    """Always returns 200 OK immediately — cloud container healthcheck safe."""
+    """Always returns 200 OK immediately — Railway healthcheck safe."""
     if _engine_ready:
         return {
             "status": "ready",
-            "engine": "Hindi RAG QA Engine v2.2",
-            "records_indexed": total_records,
-            "models": {
-                "embedding": EMBED_MODEL_NAME,
-                "dimension": VECTOR_DIM,
-                "llm": "gemini-3.1-flash-lite"
-            }
+            "engine": "Hindi RAG QA Engine v2.1",
+            "records_indexed": len(df_queries) if df_queries is not None else 0,
         }
     elif _engine_error:
         return {"status": "error", "detail": _engine_error}
@@ -345,32 +330,37 @@ async def ask_question(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
     if not _engine_ready:
-        msg = f"Engine loading error: {_engine_error}" if _engine_error else "RAG engine is still loading, please retry in a moment."
+        msg = f"Engine loading: {_engine_error}" if _engine_error else "RAG engine is still loading, please retry in a moment."
         raise HTTPException(status_code=503, detail=msg)
 
-    if (mmap_vectors is None and index_q is None) or corpus_queries is None:
+    if (mmap_vectors is None and index_q is None) or df_queries is None:
         raise HTTPException(status_code=503, detail="RAG Engine not initialized.")
+
 
     t0_rag = time.perf_counter()
 
     try:
-        # 1. High-Performance Candidate Vector Search (50 candidates in ~5ms, 0 MB RAM)
+        # 1. High-Performance Candidate Vector Search (50 candidates in <15ms, 0 MB RAM)
         candidate_k = 50
         dense_idx = []
         dense_scores = []
         dense_score_map = {}
         q_emb = get_query_embedding(query_text)
-
+        
         try:
             if q_emb is not None:
                 if mmap_vectors is not None:
-                    # 0 MB RAM vector dot product with fast argpartition
-                    scores = np.dot(mmap_vectors, q_emb)
-                    part_idx = np.argpartition(scores, -candidate_k)[-candidate_k:]
-                    dense_idx = part_idx[np.argsort(scores[part_idx])[::-1]]
+                    # 153 MB RAM vector dot product!
+                    scores = np.dot(mmap_vectors, q_emb) / 127.0
+                    
+                    # Use argpartition for O(N) top-K (faster than argsort)
+                    partitioned_idx = np.argpartition(scores, -candidate_k)[-candidate_k:]
+                    # Sort the top-K candidates
+                    dense_idx = partitioned_idx[np.argsort(scores[partitioned_idx])[::-1]]
                     dense_scores = scores[dense_idx]
+                    
                     for d_i, d_sc in zip(dense_idx, dense_scores):
-                        if 0 <= d_i < total_records:
+                        if 0 <= d_i < len(df_queries):
                             dense_score_map[int(d_i)] = float(d_sc)
                 elif index_q is not None:
                     q_emb_arr = np.array([q_emb], dtype="float32")
@@ -378,28 +368,25 @@ async def ask_question(req: QueryRequest):
                     dense_idx = dense_idx_arr[0]
                     dense_scores = dense_scores_arr[0]
                     for d_i, d_sc in zip(dense_idx, dense_scores):
-                        if 0 <= d_i < total_records:
+                        if 0 <= d_i < len(df_queries):
                             dense_score_map[int(d_i)] = float(d_sc)
         except Exception as embed_err:
             print(f"⚠️ Dense search error: {embed_err}", flush=True)
 
-
-        # 2. Fast Candidate BM25 Scoring with Devanagari Tokenizer
+        # 2. Fast Candidate BM25 Scoring
         cand_doc_ids = list(dense_score_map.keys())
         bm25_score_map = {}
         if cand_doc_ids:
-            q_tokens = tokenize_hindi(query_text)
-            bm25_batch = bm25.get_batch_scores(q_tokens, cand_doc_ids)
+            bm25_batch = bm25.get_batch_scores(query_text.split(), cand_doc_ids)
             for d_id, b_sc in zip(cand_doc_ids, bm25_batch):
                 bm25_score_map[d_id] = float(b_sc)
-
 
         # 3. Reciprocal Rank Fusion (RRF) over Candidate Pool
         k_rrf = 60
         rrf_scores = {}
         for rank, d_id in enumerate(dense_idx):
             d_id_int = int(d_id)
-            if 0 <= d_id_int < total_records:
+            if 0 <= d_id_int < len(df_queries):
                 rrf_scores[d_id_int] = rrf_scores.get(d_id_int, 0.0) + (1.0 / (k_rrf + rank + 1))
 
         bm25_sorted_cand = sorted(bm25_score_map.keys(), key=lambda x: bm25_score_map[x], reverse=True)
@@ -409,45 +396,42 @@ async def ask_question(req: QueryRequest):
         sorted_rrf_pairs = sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)[:max(req.k, 4)]
         top_candidate_indices = [pair[0] for pair in sorted_rrf_pairs]
 
-        # 4. Instant In-Memory Row Assembly (0.01 ms!)
+        # 4. Fetch ONLY top candidate rows directly from disk on-demand (0 MB RAM overhead!)
+        candidate_rows_map = fetch_candidate_rows_on_demand(top_candidate_indices)
+
         max_bm25 = max(bm25_score_map.values()) if bm25_score_map and max(bm25_score_map.values()) > 0 else 1.0
 
         retrieved_docs = []
         for rank, idx in enumerate(top_candidate_indices):
             idx_int = int(idx)
-            if idx_int < 0 or idx_int >= total_records:
-                continue
-
+            cand = candidate_rows_map.get(idx_int, {})
+            
             if idx_int in dense_score_map:
                 score_val = float(dense_score_map[idx_int])
             else:
                 bm25_norm = float(bm25_score_map.get(idx_int, 0.0)) / max_bm25 if max_bm25 > 0 else 0.5
                 score_val = 0.52 + (bm25_norm * 0.33)
-
-            cid = corpus_chunk_ids[idx_int]
-            hq = corpus_queries[idx_int]
-            ha = corpus_answers[idx_int]
-
+            
+            chunk_identifier = str(cand.get("chunk_id") or f"{cand.get('query_id', idx_int)}#0")
+            passage_identifier = str(cand.get("query_id") or cand.get("passage_id") or idx_int)
+            
             retrieved_docs.append({
-                "chunk_id": str(cid),
-                "passage_id": str(cid.split('#')[0] if '#' in str(cid) else cid),
-                "query_id": str(cid.split('#')[0] if '#' in str(cid) else cid),
+                "chunk_id": chunk_identifier,
+                "passage_id": passage_identifier,
+                "query_id": passage_identifier,
                 "strategy": "metadata_aware",
                 "score": round(score_val, 3),
-                "query": hq,
-                "matched_question": hq,
-                "answer": ha,
-                "chunk_text": ha,
+                "query": cand.get("hindi_query", ""),
+                "matched_question": cand.get("hindi_query", ""),
+                "answer": cand.get("hindi_answer", ""),
+                "chunk_text": cand.get("chunk_text") or cand.get("hindi_passage") or cand.get("hindi_answer", ""),
             })
         retrieved_docs = retrieved_docs[:max(req.k, 4)]
 
-
         retrieval_latency = (time.perf_counter() - t0_rag) * 1000
 
-        # 5. Guardrail Check (instant 0.001ms check with already-computed similarity)
-        top_sim = dense_score_map.get(top_candidate_indices[0], 0.85) if top_candidate_indices else 0.0
-        check = guardrail_check(retrieved_docs, top_sim_score=top_sim)
-
+        # 4. Guardrail Check
+        check = guardrail_check(retrieved_docs, q_emb)
 
         if not check["should_answer"]:
             total_latency = (time.perf_counter() - t0_rag) * 1000
@@ -461,7 +445,7 @@ async def ask_question(req: QueryRequest):
                 "total_latency_ms": round(total_latency, 2)
             }
 
-        # 6. Build Compact Grounded Prompt for Gemini LLM
+        # 5. Build Compact Grounded Prompt for Gemini LLM
         context_docs = "\n\n".join(
             f"Q: {doc['query']}\nA: {doc['answer']}"
             for doc in check["retrieved_context"][:3]
@@ -473,7 +457,7 @@ async def ask_question(req: QueryRequest):
 User Question: {query_text}
 Answer:"""
 
-        # 7. Call Gemini 3.1 Flash Lite for low-latency grounded generation
+        # 6. Call Gemini 3.1 Flash Lite for low-latency grounded generation
         if gemini_client is None:
             raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
 
@@ -545,6 +529,7 @@ async def voice_ask_question(file: UploadFile = File(...)):
     stt_t0 = time.perf_counter()
     transcript = ""
 
+    # Unique temp filename to avoid collisions between concurrent requests
     safe_suffix = os.path.splitext(file.filename or "audio")[-1] or ".webm"
     temp_path = f"temp_{uuid.uuid4().hex}{safe_suffix}"
 
@@ -568,6 +553,7 @@ async def voice_ask_question(file: UploadFile = File(...)):
         else:
             content_type = raw_ct.split(";")[0].strip()
 
+        # Async HTTP call so this doesn't block the event loop under concurrent load
         async with httpx.AsyncClient(timeout=15) as client:
             with open(temp_path, "rb") as audio_file:
                 files = {"file": (file.filename, audio_file, content_type)}
@@ -605,15 +591,16 @@ async def voice_ask_question(file: UploadFile = File(...)):
     return rag_response
 
 
-# ── WebSocket Proxy for Sarvam Realtime STT ──────────────────────────────────
+# ── WebSocket proxy for Sarvam realtime STT ────────────────────────────────
 SARVAM_WS_BASE = "wss://api.sarvam.ai/speech-to-text-realtime/ws"
 
 
 @app.websocket("/ws/sarvam")
 async def sarvam_ws_proxy(client_ws: WebSocket):
     """
-    Proxies browser WebSocket to Sarvam's realtime streaming endpoint,
-    injecting the Api-Subscription-Key header that browsers cannot send.
+    Proxies the browser WebSocket to Sarvam's realtime streaming endpoint,
+    injecting the Api-Subscription-Key header that browsers can't send.
+    Query params from the client are forwarded as-is to Sarvam.
     """
     if not SARVAM_API_KEY:
         await client_ws.close(code=1011, reason="SARVAM_API_KEY not configured on server")
@@ -621,6 +608,7 @@ async def sarvam_ws_proxy(client_ws: WebSocket):
 
     qs = client_ws.url.query
     sarvam_url = f"{SARVAM_WS_BASE}?{qs}" if qs else SARVAM_WS_BASE
+
     headers = {"Api-Subscription-Key": SARVAM_API_KEY}
 
     await client_ws.accept()
