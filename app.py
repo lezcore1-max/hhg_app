@@ -9,7 +9,9 @@ import pandas as pd
 import httpx
 import requests
 import pyarrow.dataset as ds
+from huggingface_hub import hf_hub_download
 from dotenv import load_dotenv
+
 
 # ── Windows UTF-8 console fix ──────────────────────────────────────────────
 if sys.platform.startswith("win"):
