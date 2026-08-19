@@ -351,7 +351,12 @@ async def ask_question(req: QueryRequest):
             if q_emb is not None:
                 if mmap_vectors is not None:
                     # 153 MB RAM vector dot product!
-                    scores = np.dot(mmap_vectors, q_emb) / 127.0
+                    # Calculate in chunks to prevent NumPy from silently allocating a 750 MB float32 temporary matrix
+                    scores = np.empty(len(mmap_vectors), dtype=np.float32)
+                    chunk_sz = 10000
+                    for c_idx in range(0, len(mmap_vectors), chunk_sz):
+                        np.dot(mmap_vectors[c_idx:c_idx+chunk_sz], q_emb, out=scores[c_idx:c_idx+chunk_sz])
+                    scores /= 127.0
                     
                     # Use argpartition for O(N) top-K (faster than argsort)
                     partitioned_idx = np.argpartition(scores, -candidate_k)[-candidate_k:]
