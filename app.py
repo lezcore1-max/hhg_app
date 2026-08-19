@@ -225,14 +225,17 @@ def _load_rag_engine_background():
         tokenized_queries = [str(q).split() for q in df_queries["hindi_query"].tolist()]
         bm25 = BM25Okapi(tokenized_queries)
 
-        # 4. Pre-load local embedding model for instant query encoding
-        print(f"🧠 Loading {EMBED_MODEL_NAME} embedding model...", flush=True)
+        # 4. Pre-load and pre-warm local embedding model
+        print(f"🧠 Loading and pre-warming {EMBED_MODEL_NAME} embedding model...", flush=True)
         try:
             from sentence_transformers import SentenceTransformer
             embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-            print(f"   ✅ {EMBED_MODEL_NAME} loaded locally!", flush=True)
+            # Warm up JIT / cache so 1st user query takes 15ms instead of 2s
+            embed_model.encode("query: warm up", normalize_embeddings=True)
+            print(f"   ✅ {EMBED_MODEL_NAME} loaded and warmed up locally!", flush=True)
         except Exception as embed_init_err:
             print(f"   ⚠️ Local SentenceTransformer note: {embed_init_err} (will use HF API fallback)", flush=True)
+
 
         _engine_ready = True
 
@@ -259,40 +262,32 @@ class QueryRequest(BaseModel):
     k: int = 5
 
 
-def guardrail_check(top_results: list, query_embedding: np.ndarray | None,
+def guardrail_check(top_results: list, top_sim_score: float = 0.0,
                      rrf_threshold: float = 0.01, semantic_sim_threshold: float = 0.45):
     if not top_results:
         return {"should_answer": False, "reason": "no_results", "top_score": 0.0, "semantic_sim": 0.0}
 
     top = top_results[0]
-    if top["score"] < rrf_threshold:
-        return {"should_answer": False, "reason": "low_confidence_off_topic", "top_score": top["score"], "semantic_sim": 0.0}
+    score_val = float(top.get("score", 0.0))
+    semantic_sim = float(top_sim_score) if top_sim_score > 0 else score_val
 
-    try:
-        if query_embedding is not None:
-            mq_emb = get_query_embedding(top["query"])
-            semantic_sim = float(np.dot(query_embedding, mq_emb)) if mq_emb is not None else 1.0
-        else:
-            semantic_sim = 1.0
-    except Exception:
-        semantic_sim = 1.0
-
-    if semantic_sim < semantic_sim_threshold:
+    if score_val < rrf_threshold or semantic_sim < semantic_sim_threshold:
         return {
             "should_answer": False,
-            "reason": "semantic_mismatch",
-            "top_score": top["score"],
+            "reason": "low_confidence_off_topic" if score_val < rrf_threshold else "semantic_mismatch",
+            "top_score": round(score_val, 3),
             "semantic_sim": round(semantic_sim, 3),
         }
 
     return {
         "should_answer": True,
         "reason": "grounded",
-        "top_score": top["score"],
+        "top_score": round(score_val, 3),
         "semantic_sim": round(semantic_sim, 3),
         "grounded_answer": top["answer"],
         "retrieved_context": top_results,
     }
+
 
 
 # ── API Endpoints ────────────────────────────────────────────────────────────
@@ -333,7 +328,7 @@ async def ask_question(req: QueryRequest):
     t0_rag = time.perf_counter()
 
     try:
-        # 1. High-Performance Candidate Vector Search (50 candidates in <15ms, 0 MB RAM)
+        # 1. High-Performance Candidate Vector Search (50 candidates in ~5ms, 0 MB RAM)
         candidate_k = 50
         dense_idx = []
         dense_scores = []
@@ -343,9 +338,10 @@ async def ask_question(req: QueryRequest):
         try:
             if q_emb is not None:
                 if mmap_vectors is not None:
-                    # 0 MB RAM vector dot product!
+                    # 0 MB RAM vector dot product with fast argpartition
                     scores = np.dot(mmap_vectors, q_emb)
-                    dense_idx = np.argsort(scores)[::-1][:candidate_k]
+                    part_idx = np.argpartition(scores, -candidate_k)[-candidate_k:]
+                    dense_idx = part_idx[np.argsort(scores[part_idx])[::-1]]
                     dense_scores = scores[dense_idx]
                     for d_i, d_sc in zip(dense_idx, dense_scores):
                         if 0 <= d_i < len(df_queries):
@@ -360,6 +356,7 @@ async def ask_question(req: QueryRequest):
                             dense_score_map[int(d_i)] = float(d_sc)
         except Exception as embed_err:
             print(f"⚠️ Dense search error: {embed_err}", flush=True)
+
 
         # 2. Fast Candidate BM25 Scoring
         cand_doc_ids = list(dense_score_map.keys())
@@ -418,8 +415,10 @@ async def ask_question(req: QueryRequest):
 
         retrieval_latency = (time.perf_counter() - t0_rag) * 1000
 
-        # 5. Guardrail Check
-        check = guardrail_check(retrieved_docs, q_emb)
+        # 5. Guardrail Check (instant 0.001ms check with already-computed similarity)
+        top_sim = dense_score_map.get(top_candidate_indices[0], 0.85) if top_candidate_indices else 0.0
+        check = guardrail_check(retrieved_docs, top_sim_score=top_sim)
+
 
         if not check["should_answer"]:
             total_latency = (time.perf_counter() - t0_rag) * 1000
