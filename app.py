@@ -56,15 +56,6 @@ def _download_file_with_progress(url: str, dest_path: str, fname: str):
 
 def _ensure_data_files():
     """Download FAISS index and Parquet from HuggingFace Hub with live MB logs."""
-    # Clean up old large files from previous model to free disk space
-    old_files = ["hindi_passages.faiss"]
-    for old_f in old_files:
-        old_path = os.path.join(DATA_DIR, old_f)
-        if os.path.exists(old_path):
-            print(f"🧹 Removing old file {old_f} to free disk space...", flush=True)
-            os.remove(old_path)
-            print(f"   ✅ Removed {old_f}", flush=True)
-
     files_needed = ["small_hindi_passages.faiss", "chunks_for_embedding.parquet"]
     missing = [f for f in files_needed if not os.path.exists(os.path.join(DATA_DIR, f))]
     if not missing:
@@ -137,18 +128,27 @@ def get_query_embedding(query_text: str):
     """Lightweight query embedding via HF Inference API (intfloat/multilingual-e5-small, 384-dim)."""
     hf_token = os.environ.get("HF_TOKEN", "")
     try:
-        from huggingface_hub import InferenceClient
-        client = InferenceClient(api_key=hf_token)
-        emb = client.feature_extraction(f"query: {query_text}", model=EMBED_MODEL_NAME)
+        import requests
+        url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBED_MODEL_NAME}"
+        headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+        res = requests.post(url, headers=headers, json={"inputs": f"query: {query_text}"}, timeout=10)
+        
+        if res.status_code != 200:
+            print(f"⚠️ get_query_embedding HTTP {res.status_code}: {res.text}", flush=True)
+            return None
+            
+        emb = res.json()
         arr = np.array(emb, dtype="float32")
+        
         if arr.ndim == 2:
             arr = arr.mean(axis=0)
         elif arr.ndim == 3:
             arr = arr[0].mean(axis=0)
+            
         norm = np.linalg.norm(arr)
         return (arr / norm) if norm > 0 else arr
     except Exception as e:
-        print(f"⚠️ get_query_embedding HF API error: {e}", flush=True)
+        print(f"⚠️ get_query_embedding error: {e}", flush=True)
         return None
 
 
