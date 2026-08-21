@@ -5,15 +5,21 @@ venv/
 .venv/
 *.egg-info/
 
-# Secrets — never commit real keys
+# Secrets & Security — never commit real keys or private keys
 .env
-# .env.example is safe to commit (no real keys)
+*.pem
+*.key
+*.cert
 
 # Large binary & parquet dataset files (downloaded automatically from HF Hub on startup)
 *.parquet
 *.faiss
 *.npy
 *.pkl
+*.onnx
+onnx/
+tokenizer.json
+.cache/
 asmtrain.parquet
 hintrain.parquet
 hinval.parquet
