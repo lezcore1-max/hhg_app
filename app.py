@@ -357,14 +357,15 @@ def _load_rag_engine_background():
                 # Step 1: Read schema only (zero RAM) to resolve column names
                 schema_names = pq.read_schema(parquet_path).names
                 q_col = cfg["query_col"] if cfg["query_col"] in schema_names else ("hindi_query" if "hindi_query" in schema_names else "query")
-                a_col = cfg["answer_col"] if cfg["answer_col"] in schema_names else ("hindi_answer" if "hindi_answer" in schema_names else "answer")
+                # Prefer full passage chunk_text over short single-line answer label
+                p_col = "chunk_text" if "chunk_text" in schema_names else (cfg["answer_col"] if cfg["answer_col"] in schema_names else "answer")
                 c_col = "chunk_id" if "chunk_id" in schema_names else "query_id"
 
-                # Step 2: Load ONLY the 3 required columns (saves ~60% RAM vs full read)
-                df_sample = pd.read_parquet(parquet_path, columns=[c_col, q_col, a_col])
+                # Step 2: Load ONLY the 3 required columns
+                df_sample = pd.read_parquet(parquet_path, columns=[c_col, q_col, p_col])
                 store["chunk_ids"] = df_sample[c_col].tolist()
                 store["queries"] = df_sample[q_col].astype(str).tolist()
-                store["answers"] = df_sample[a_col].astype(str).tolist()
+                store["answers"] = df_sample[p_col].astype(str).tolist()
                 store["total_records"] = len(store["queries"])
                 total_all_records += store["total_records"]
                 del df_sample
