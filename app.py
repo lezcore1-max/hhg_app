@@ -155,9 +155,32 @@ def detect_language(text: str, sarvam_lang_code: str | None = None) -> str:
     if any("\u0A80" <= c <= "\u0AFF" for c in text):
         return "gu"
     
-    # Devanagari script (U+0900 to U+097F) -> default to Hindi / Devanagari
+    # Devanagari script (U+0900 to U+097F) -> differentiate Marathi vs Hindi
     if any("\u0900" <= c <= "\u097F" for c in text):
         if "ळ" in text or "ऱ" in text:
+            return "mr"
+        
+        words = set(re.findall(r"[\u0900-\u097F]+", text))
+        
+        marathi_markers = {
+            "आहे", "आहेत", "होते", "होता", "होती", "नाही", "कसे", "कसा", "कशी",
+            "काय", "केले", "केली", "करावे", "मधील", "मध्ये", "पासून", "साठी",
+            "करणे", "झाले", "झाली", "येथे", "त्यांचे", "त्यांना", "आपण", "घेणे",
+            "पाहिजे", "असते", "असतो", "असतात", "नव्हते", "नव्हता", "का", "आधीच",
+            "कधी", "कशा", "कशासाठी", "किती", "कुठे", "कोठे", "कोण", "कोणी",
+            "झाला", "गेला", "गेली", "द्या", "सांगा", "सांग", "मगरीचे", "काढायचे"
+        }
+        
+        hindi_markers = {
+            "है", "हैं", "था", "थी", "थे", "क्या", "क्यों", "कैसे", "कहाँ",
+            "नहीं", "किया", "करना", "में", "से", "लिए", "होता", "होती",
+            "सकता", "सकती", "सकते", "चाहिए", "बनवाएं", "कैसे"
+        }
+        
+        mr_score = len(words & marathi_markers) + sum(1 for w in words if w.endswith(("चे", "च्या", "तील", "वरून", "कडून")) and len(w) > 3)
+        hi_score = len(words & hindi_markers)
+        
+        if mr_score > hi_score:
             return "mr"
         return "hi"
     
