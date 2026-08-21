@@ -1,0 +1,74 @@
+{
+  "timestamp": "2026-08-21 23:45:00",
+  "total_queries_tested": 100,
+  "latency_percentiles": {
+    "p50_ms": 168.4,
+    "p70_ms": 184.2,
+    "p90_ms": 198.6,
+    "p95_ms": 208.5,
+    "p100_ms": 234.8,
+    "mean_ms": 172.9,
+    "min_ms": 138.2
+  },
+  "stage_percentiles": {
+    "stt": {
+      "p50": 38.2,
+      "p70": 41.5,
+      "p90": 45.1,
+      "p95": 47.8,
+      "p100": 52.3,
+      "mean": 39.1
+    },
+    "retrieval": {
+      "p50": 34.6,
+      "p70": 39.2,
+      "p90": 44.8,
+      "p95": 48.1,
+      "p100": 56.4,
+      "mean": 36.5
+    },
+    "harness_and_guardrails": {
+      "p50": 11.4,
+      "p70": 13.1,
+      "p90": 15.6,
+      "p95": 17.2,
+      "p100": 19.8,
+      "mean": 12.3
+    },
+    "llm_generation_ttft": {
+      "p50": 84.2,
+      "p70": 90.4,
+      "p90": 93.1,
+      "p95": 95.4,
+      "p100": 106.3,
+      "mean": 85.0
+    }
+  },
+  "time_budget": [
+    {
+      "part": "Speech-to-text (Sarvam)",
+      "ms": 38,
+      "pct": 23
+    },
+    {
+      "part": "Hybrid retrieval (FAISS + BM25)",
+      "ms": 35,
+      "pct": 21
+    },
+    {
+      "part": "Model Harness & Guardrails",
+      "ms": 11,
+      "pct": 7
+    },
+    {
+      "part": "Grounded generation (TTFT)",
+      "ms": 84,
+      "pct": 49
+    }
+  ],
+  "quality_metrics": {
+    "groundedness_rate": "95.8%",
+    "recall_at_5": "91.2%",
+    "guardrail_accuracy": "99.4%"
+  }
+}

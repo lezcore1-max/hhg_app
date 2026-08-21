@@ -11,10 +11,10 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy only app.py — data files are auto-downloaded from HuggingFace Hub at startup
-COPY app.py .
+# Copy backend Python code and benchmark assets (large data parquet/faiss auto-downloaded from Hugging Face Hub at startup)
+COPY *.py ./
+COPY *.json ./
 
 EXPOSE 8000
 
 CMD ["python", "app.py"]
-
